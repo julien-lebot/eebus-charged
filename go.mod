@@ -1,6 +1,6 @@
 module github.com/julienar/eebus-charged
 
-go 1.24.0
+go 1.23
 
 require (
 	github.com/enbility/eebus-go v0.7.0
