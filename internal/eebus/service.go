@@ -387,7 +387,7 @@ func (s *Service) ServicePairingDetailUpdate(ski string, detail *shipapi.Connect
 	state := detail.State()
 	s.logger.Info("Pairing detail update",
 		zap.String("ski", ski),
-		zap.String("state", string(state)),
+		zap.String("state", fmt.Sprintf("%v", state)),
 		zap.Int("state_code", int(state)),
 	)
 	
