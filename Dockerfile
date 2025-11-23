@@ -27,9 +27,6 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/eebus-charged .
 
-# Copy default config
-COPY config.yaml .
-
 # Create directories
 RUN mkdir -p /app/certs
 
