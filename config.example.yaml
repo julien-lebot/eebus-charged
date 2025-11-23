@@ -45,7 +45,7 @@ certificates:
 #
 # chargers:
 #   - name: "garage_wallbox"        # Your custom name
-#     ski: "a4bd-3e46-cb83..."       # Get from logs on first connection
+#     ski: "abcd-1234-5678-90ef-1234-5678-90ab-cdef-1234-5678"  # Get from logs on first connection
 #     ip: "10.10.10.10"              # Optional: force direct IP
 #
 # If not configured, chargers auto-discover and get auto-generated names like:
