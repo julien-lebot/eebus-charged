@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  eebus-charged:
+    build: .
+    image: eebus-charged:latest
+    container_name: eebus-charged
+    restart: unless-stopped
+    
+    # Network mode: host is required for EEBUS mDNS discovery
+    network_mode: host
+    
+    volumes:
+      # Mount configuration
+      - ./config.yaml:/app/config.yaml:ro
+      # Persist certificates
+      - ./certs:/app/certs
+      
+    environment:
+      - TZ=Europe/Paris
+      
+    # Optional: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

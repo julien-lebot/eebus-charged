@@ -1,0 +1,95 @@
+# EEBUS Charged Configuration Example
+# Copy this file to config.yaml and adjust the values
+
+# Service configuration - identifies your HEMS on the network
+service:
+  # Brand name visible to other EEBUS devices
+  brand: "Custom HEMS"
+  
+  # Model name
+  model: "EEBUS-CHARGED v1.0"
+  
+  # Serial number - MUST be unique for your installation
+  # You can generate one with: uuidgen | tr -d '-' | head -c 10
+  serial: "HEMS-001"
+  
+  # Device name visible to other devices
+  device_name: "Home Energy Manager"
+
+# Network configuration
+network:
+  # Port for EEBUS communication (default: 4712)
+  port: 4712
+  
+  # Port for HTTP control API (default: 8080)
+  api_port: 8080
+  
+  # Network interface to bind to
+  # Leave empty to listen on all interfaces
+  # Examples: "eth0", "en0", "wlan0"
+  interface: ""
+
+# Certificate configuration
+certificates:
+  # Certificates are auto-generated if not present
+  # They will be stored in these paths
+  cert_file: "./certs/cert.pem"
+  key_file: "./certs/key.pem"
+
+# Optional: Manually configure chargers
+# Leave empty for auto-discovery via mDNS
+# Only needed if:
+#   - mDNS doesn't work on your network
+#   - You want to use custom names instead of auto-generated ones
+#   - You want to force direct IP connection
+#
+# chargers:
+#   - name: "garage_wallbox"        # Your custom name
+#     ski: "a4bd-3e46-cb83..."       # Get from logs on first connection
+#     ip: "10.10.10.10"              # Optional: force direct IP
+#
+# If not configured, chargers auto-discover and get auto-generated names like:
+#   - "charger_12345678" (from last 8 chars of SKI)
+# You can then add them to config with your preferred names
+
+# Charging parameters
+charging:
+  # Minimum charging current in Amperes
+  # Most EVs support 6A, some can go as low as 2.2A
+  min_current: 6.0
+  
+  # Maximum charging current in Amperes
+  # This should match your electrical installation capacity
+  # Common values:
+  #   - 16A for standard installations
+  #   - 32A for high-power installations
+  #   - Check your main breaker rating
+  max_current: 28.0
+  
+  # Default charging current in Amperes
+  # Used when starting a new charging session
+  default_current: 16.0
+  
+  # Number of phases (1 or 3)
+  # 1 = single-phase (max ~7kW at 32A)
+  # 3 = three-phase (max ~22kW at 32A)
+  phases: 3
+
+# Logging configuration
+logging:
+  # Log level: debug, info, warn, error
+  # Use "debug" for troubleshooting
+  # Use "info" for normal operation
+  level: "info"
+  
+  # Log format: console, json
+  # "console" is human-readable, good for interactive use
+  # "json" is structured, good for log aggregation systems
+  format: "console"
+  
+  # Optional: Log file path
+  # If set, logs ONLY to file (not console)
+  # Leave empty to log to console
+  file: ""
+  # Example: file: "/var/log/eebus-charged.log"
+

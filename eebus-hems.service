@@ -1,0 +1,33 @@
+[Unit]
+Description=EEBUS Charger Control System
+Documentation=https://github.com/julienar/eebus-charged
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eebus
+Group=eebus
+WorkingDirectory=/opt/eebus-charged
+ExecStart=/opt/eebus-charged/eebus-charged run --config /opt/eebus-charged/config.yaml
+Restart=on-failure
+RestartSec=10s
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/eebus-charged/certs
+
+# Resource limits
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eebus-charged
+
+[Install]
+WantedBy=multi-user.target
+

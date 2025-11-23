@@ -1,0 +1,48 @@
+# Binaries
+eebus-hems
+eebus-hems.exe
+eebus-hems-*
+
+# Certificates (regenerated automatically)
+certs/
+*.pem
+
+# Configuration (may contain sensitive data)
+config.yaml
+config.local.yaml
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test binaries
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
