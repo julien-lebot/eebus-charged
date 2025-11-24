@@ -42,12 +42,13 @@ type Charger struct {
 	opEV  ucapi.CemOPEVInterface
 	oscEV ucapi.CemOSCEVInterface
 
-	mu            sync.RWMutex
-	evEntity      spineapi.EntityRemoteInterface
-	currentLimit  float64
-	vehicleID     string
-	isConnected   bool
-	chargingState ChargingState
+	mu                  sync.RWMutex
+	evEntity            spineapi.EntityRemoteInterface
+	currentLimit        float64
+	vehicleID           string
+	isConnected         bool
+	chargingState       ChargingState
+	communicationStandard string // ISO 15118-2, ISO 15118-20, etc.
 }
 
 // NewCharger creates a new charger instance
@@ -248,7 +249,7 @@ func (c *Charger) SetCurrentLimit(current float64) error {
 		}
 	}
 
-	c.logger.Info("Current limit updated", zap.Float64("current", current))
+	c.logger.Debug("Current limit updated", zap.Float64("current", current))
 	c.publishState()
 	return nil
 }
@@ -277,8 +278,14 @@ func (c *Charger) GetStatus() map[string]interface{} {
 
 // writeCurrentLimit writes the current limit to the EV via EEBUS
 func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, current float64) error {
+	span := tracer.StartSpan("charger.write_current_limit",
+		tracer.Tag("charger", c.config.Name),
+		tracer.Tag("current", current))
+	defer span.Finish()
+
 	// Check if overload protection is available
 	if !c.opEV.IsScenarioAvailableAtEntity(evEntity, 1) {
+		span.SetTag("error", "overload protection not available")
 		return fmt.Errorf("overload protection not available")
 	}
 
@@ -322,6 +329,7 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 	// Write the overload protection limits
 	_, err = c.opEV.WriteLoadControlLimits(evEntity, limits, nil)
 	if err != nil {
+		span.SetTag("error", err.Error())
 		return fmt.Errorf("failed to write load control limits: %w", err)
 	}
 
@@ -335,6 +343,10 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 
 // disableLimits disables all limits for a given use case
 func (c *Charger) disableLimits(evEntity spineapi.EntityRemoteInterface, uc interface{}) error {
+	span := tracer.StartSpan("charger.disable_limits",
+		tracer.Tag("charger", c.config.Name))
+	defer span.Finish()
+
 	type limitController interface {
 		LoadControlLimits(spineapi.EntityRemoteInterface) ([]ucapi.LoadLimitsPhase, error)
 		WriteLoadControlLimits(spineapi.EntityRemoteInterface, []ucapi.LoadLimitsPhase, func(result any)) (*uint64, error)
@@ -342,11 +354,13 @@ func (c *Charger) disableLimits(evEntity spineapi.EntityRemoteInterface, uc inte
 
 	controller, ok := uc.(limitController)
 	if !ok {
+		span.SetTag("error", "use case does not support load control limits")
 		return fmt.Errorf("use case does not support load control limits")
 	}
 
 	limits, err := controller.LoadControlLimits(evEntity)
 	if err != nil {
+		span.SetTag("error", err.Error())
 		return err
 	}
 
@@ -361,6 +375,9 @@ func (c *Charger) disableLimits(evEntity spineapi.EntityRemoteInterface, uc inte
 
 	if writeNeeded {
 		_, err = controller.WriteLoadControlLimits(evEntity, limits, nil)
+		if err != nil {
+			span.SetTag("error", err.Error())
+		}
 	}
 
 	return err
@@ -368,65 +385,59 @@ func (c *Charger) disableLimits(evEntity spineapi.EntityRemoteInterface, uc inte
 
 // handleUseCaseEvent handles EEBUS use case events
 func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, entity spineapi.EntityRemoteInterface, event eebusapi.EventType) {
+	span := tracer.StartSpan("charger.handle_use_case_event",
+		tracer.Tag("charger", c.config.Name),
+		tracer.Tag("event", string(event)))
+	defer span.Finish()
+
 	c.mu.Lock()
 	c.evEntity = entity
 	wasConnected := c.isConnected
-	c.mu.Unlock()
-
 	switch event {
 	case evcc.EvConnected:
-		// EV connected - automatically stop charging to prevent unwanted charging
-		c.mu.Lock()
-		c.isConnected = true
-		c.mu.Unlock()
-
-		// Try to get vehicle identification
-		if identifications, err := c.evCC.Identifications(entity); err == nil && len(identifications) > 0 {
-			c.mu.Lock()
-			c.vehicleID = identifications[0].Value
-			c.mu.Unlock()
-			c.logger.Info("Vehicle connected",
-				zap.String("vehicle_id", c.vehicleID))
-		} else {
-			c.logger.Info("Vehicle connected (identification not available)")
-		}
-
-		// Log communication standard (important for understanding SoC availability)
-		if commStd, err := c.evCC.CommunicationStandard(entity); err == nil {
-			c.logger.Info("Vehicle communication standard",
-				zap.String("standard", string(commStd)))
-		}
-
-		// Vehicle connected - user must explicitly call StartCharging() or StopCharging()
 		c.logger.Info("Vehicle connected")
-		c.publishState()
-
+		c.isConnected = true
 	case evcc.EvDisconnected:
-		// EV disconnected
-		c.mu.Lock()
 		c.logger.Info("Vehicle disconnected")
 		c.evEntity = nil
 		c.isConnected = false
 		c.vehicleID = ""
 		c.chargingState = ChargingStateUnknown
-		c.mu.Unlock()
-		c.publishState()
-
-		default:
-		// Other events like DataUpdateCurrentPerPhase
+		c.communicationStandard = ""
+	default:
 		if wasConnected {
-			c.mu.Lock()
+			// Other events like DataUpdateCurrentPerPhase - only update if vehicle was already connected
 			c.updateChargingState()
-			c.mu.Unlock()
-			c.publishState()
 		}
 	}
+	
+	c.mu.Unlock()
+	c.publishState()
 }
 
 // updateChargingState updates the charging state based on current measurements
 func (c *Charger) updateChargingState() {
+	span := tracer.StartSpan("charger.update_charging_state",
+		tracer.Tag("charger", c.config.Name))
+	defer span.Finish()
+
 	if c.evEntity == nil {
 		return
+	}
+
+	if c.vehicleID == "" {
+		if identifications, err := c.evCC.Identifications(c.evEntity); err == nil && len(identifications) > 0 {
+			c.vehicleID = identifications[0].Value
+			c.logger.Info("Vehicle identification received",
+				zap.String("vehicle_id", c.vehicleID))
+		}
+	}
+	if c.communicationStandard == "" {
+		if commStd, err := c.evCC.CommunicationStandard(c.evEntity); err == nil {
+			c.communicationStandard = string(commStd)
+			c.logger.Info("Vehicle communication standard received",
+				zap.String("standard", string(commStd)))
+		}
 	}
 
 	// Try to get the charge state from EVCC
