@@ -18,6 +18,7 @@ type Config struct {
 	Logging      LoggingConfig      `mapstructure:"logging"`
 	Datadog      DatadogConfig      `mapstructure:"datadog"`
 	MQTT         MQTTConfig         `mapstructure:"mqtt"`
+	Vehicles     map[string]string  `mapstructure:"vehicles"` // Optional: map vehicle_id -> friendly_name
 }
 
 // ServiceConfig contains service identification

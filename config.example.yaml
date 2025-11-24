@@ -93,3 +93,10 @@ logging:
   file: ""
   # Example: file: "/var/log/eebus-charged.log"
 
+# Optional: Vehicle name mapping
+# Maps vehicle ID (MAC address from EEBUS) to friendly names
+# The vehicle ID will be logged when a vehicle connects - use that value here
+vehicles:
+  "AA:BB:CC:DD:EE:FF": "Porsche Macan"
+  # Add more vehicles as needed
+

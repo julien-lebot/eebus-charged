@@ -519,7 +519,7 @@ func (s *Service) findChargerBySKI(ski string) (*Charger, bool) {
 // addCharger adds a charger to the service
 func (s *Service) addCharger(cfg config.ChargerConfig, device spineapi.DeviceRemoteInterface) {
 	s.mu.Lock()
-	charger := NewCharger(cfg, device, s.logger, &s.config.Charging, s.evCC, s.evCem, s.evSoc, s.opEV, s.oscEV, s.mqttHandler)
+	charger := NewCharger(cfg, device, s.logger, &s.config.Charging, s.evCC, s.evCem, s.evSoc, s.opEV, s.oscEV, s.mqttHandler, s.config.Vehicles)
 	s.chargers[cfg.Name] = charger
 	s.mu.Unlock()
 

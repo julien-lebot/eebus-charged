@@ -34,6 +34,7 @@ type Charger struct {
 	device      spineapi.DeviceRemoteInterface
 	logger      *zap.Logger
 	mqttHandler *mqtt.MqttHandler
+	vehicleNames map[string]string // Optional: map vehicle_id -> friendly_name
 
 	// EEBUS use cases
 	evCC  ucapi.CemEVCCInterface
@@ -63,6 +64,7 @@ func NewCharger(
 	opEV ucapi.CemOPEVInterface,
 	oscEV ucapi.CemOSCEVInterface,
 	mqttHandler *mqtt.MqttHandler,
+	vehicleNames map[string]string,
 ) *Charger {
 	return &Charger{
 		config:        cfg,
@@ -75,6 +77,7 @@ func NewCharger(
 		evSoc:         evSoc,
 		opEV:          opEV,
 		oscEV:         oscEV,
+		vehicleNames:  vehicleNames,
 		currentLimit:  chargingCfg.DefaultCurrent,
 		chargingState: ChargingStateUnknown,
 	}
@@ -516,10 +519,18 @@ func (c *Charger) publishState() {
 		}
 	}
 
+	// Get friendly vehicle name from config if available
+	vehicleName := ""
+	if c.vehicleNames != nil && c.vehicleID != "" {
+		if friendlyName, ok := c.vehicleNames[c.vehicleID]; ok {
+			vehicleName = friendlyName
+		}
+	}
+
 	state := &mqtt.ChargerState{
 		VehicleConnected:  c.isConnected,
 		VehicleIdentity:   c.vehicleID,
-		VehicleName:       c.vehicleID, // EEBUS doesn't provide a separate name
+		VehicleName:       vehicleName,
 		Charging:          c.chargingState == ChargingStateActive && chargePower > 100,
 		ChargingState:     string(c.chargingState),
 		ChargePower:       chargePower,
