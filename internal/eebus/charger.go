@@ -283,9 +283,12 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 	}
 
 	// Get current limits from EVSE to know what's possible
+	// This may fail if data isn't available yet - that's OK, we'll still try to write limits
 	_, maxLimits, _, err := c.opEV.CurrentLimits(evEntity)
 	if err != nil {
-		c.logger.Warn("Could not get current limits from EVSE", zap.Error(err))
+		c.logger.Debug("Could not get current limits from EVSE (data may not be available yet)", zap.Error(err))
+		// Continue anyway - we'll set limits without max limit validation
+		maxLimits = nil
 	}
 
 	// Setup the limit data for all phases
@@ -298,7 +301,8 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 		}
 
 		// If the limit equals or exceeds the max allowed, the limit is inactive
-		if phase < len(maxLimits) && current >= maxLimits[phase] {
+		// Only do this if we successfully got maxLimits
+		if maxLimits != nil && phase < len(maxLimits) && current >= maxLimits[phase] {
 			limit.IsActive = false
 		}
 
@@ -393,14 +397,9 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 				zap.String("standard", string(commStd)))
 		}
 
-		// Automatically stop charging when vehicle connects
-		// User must explicitly call StartCharging() to begin charging
-		// Note: c.evEntity is already set above, so StopCharging() will work
-		if err := c.StopCharging(); err != nil {
-			c.logger.Warn("Failed to stop charging on connect", zap.Error(err))
-		} else {
-			c.logger.Info("Vehicle connected - charging stopped (call start to begin)")
-		}
+		// Vehicle connected - user must explicitly call StartCharging() or StopCharging()
+		c.logger.Info("Vehicle connected")
+		c.publishState()
 
 	case evcc.EvDisconnected:
 		// EV disconnected
@@ -413,7 +412,7 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		c.mu.Unlock()
 		c.publishState()
 
-	default:
+		default:
 		// Other events like DataUpdateCurrentPerPhase
 		if wasConnected {
 			c.mu.Lock()

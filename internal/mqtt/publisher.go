@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -157,15 +158,24 @@ func (h *MqttHandler) handleCommandMessage(client mqtt.Client, msg mqtt.Message)
 	var action string
 	var cmdReq CommandRequest
 	
-	// Try to parse as JSON first (for set_current with current value)
+	// Try to parse as JSON first (for set_current with current value or response_topic)
 	if err := json.Unmarshal(payload, &cmdReq); err == nil && cmdReq.Current > 0 {
 		// JSON with current value = set_current command
 		action = "set_current"
-	} else {
-		// Simple string action (start/stop)
+	} else if err == nil {
+		// Valid JSON but no current - might have response_topic, treat as string action
 		action = payloadStr
-		// Try to parse as JSON for response_topic even if it's a string action
-		json.Unmarshal(payload, &cmdReq)
+	} else {
+		// Not JSON - could be string action (start/stop) or plain number (for set_current)
+		// Try to parse as number
+		if current, err := strconv.ParseFloat(payloadStr, 64); err == nil && current > 0 {
+			// Plain number = set_current command
+			action = "set_current"
+			cmdReq.Current = current
+		} else {
+			// Simple string action (start/stop)
+			action = payloadStr
+		}
 	}
 
 	span.SetTag("charger", chargerName)

@@ -328,6 +328,18 @@ The switch will:
       device_class: energy
       state_class: total_increasing
 
+  number:
+    - name: "EV Charger Current Limit"
+      unique_id: "ev_charger_current_limit_control"
+      state_topic: "hems/chargers/garage_wallbox/current_limit"
+      command_topic: "hems/chargers/garage_wallbox/command"
+      min: 1
+      max: 32
+      step: 0.1
+      unit_of_measurement: "A"
+      device_class: current
+      icon: "mdi:current-ac"
+
   binary_sensor:
     - name: "EV Charger Vehicle Connected"
       object_id: "ev_charger_vehicle_connected"
