@@ -428,18 +428,34 @@ func (c *Charger) updateChargingState() {
 		return
 	}
 
+	// Try to get vehicle identification (only if we don't have it yet)
+	// Skip empty values - EEBUS may return empty before the actual value is available
 	if c.vehicleID == "" {
 		if identifications, err := c.evCC.Identifications(c.evEntity); err == nil && len(identifications) > 0 {
-			c.vehicleID = identifications[0].Value
-			c.logger.Info("Vehicle identification received",
-				zap.String("vehicle_id", c.vehicleID))
+			newID := identifications[0].Value
+			if newID != "" {
+				c.vehicleID = newID
+				c.logger.Info("Vehicle identification received",
+					zap.String("vehicle_id", c.vehicleID))
+			}
 		}
 	}
-	if c.communicationStandard == "" {
-		if commStd, err := c.evCC.CommunicationStandard(c.evEntity); err == nil {
-			c.communicationStandard = string(commStd)
-			c.logger.Info("Vehicle communication standard received",
-				zap.String("standard", string(commStd)))
+	
+	// Try to get communication standard (check every time - it can upgrade during session)
+	// e.g., IEC 61851 -> ISO 15118-2 -> ISO 15118-20
+	if commStd, err := c.evCC.CommunicationStandard(c.evEntity); err == nil {
+		newStd := string(commStd)
+		if newStd != "" && newStd != c.communicationStandard {
+			oldStd := c.communicationStandard
+			c.communicationStandard = newStd
+			if oldStd == "" {
+				c.logger.Info("Vehicle communication standard received",
+					zap.String("standard", c.communicationStandard))
+			} else {
+				c.logger.Info("Vehicle communication standard upgraded",
+					zap.String("old_standard", oldStd),
+					zap.String("new_standard", c.communicationStandard))
+			}
 		}
 	}
 
