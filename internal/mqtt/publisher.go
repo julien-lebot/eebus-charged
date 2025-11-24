@@ -112,9 +112,9 @@ func (h *MqttHandler) SubscribeToCommands(handler CommandHandler) error {
 
 	h.handler = handler
 
-	// Subscribe to all charger commands: {prefix}/chargers/+/command/+
-	commandTopic := fmt.Sprintf("%s/chargers/+/command/+", h.topicPrefix)
-	
+	// Subscribe to command topic: {prefix}/chargers/+/command
+	// Action is in the payload: "start", "stop", or JSON for set_current
+	commandTopic := fmt.Sprintf("%s/chargers/+/command", h.topicPrefix)
 	token := h.client.Subscribe(commandTopic, 1, h.handleCommandMessage)
 	if token.Wait() && token.Error() != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", commandTopic, token.Error())
@@ -138,27 +138,38 @@ func (h *MqttHandler) handleCommandMessage(client mqtt.Client, msg mqtt.Message)
 
 	h.logger.Debug("Received MQTT command", zap.String("topic", topic), zap.String("payload", string(payload)))
 
-	// Parse topic: {prefix}/chargers/{chargerName}/command/{action}
+	// Parse topic: {prefix}/chargers/{chargerName}/command
 	parts := strings.Split(topic, "/")
-	if len(parts) < 5 || parts[len(parts)-2] != "command" {
+	if len(parts) < 4 || parts[len(parts)-1] != "command" {
 		h.logger.Warn("Invalid command topic format", zap.String("topic", topic))
 		return
 	}
 
-	chargerName := parts[len(parts)-3]
-	action := parts[len(parts)-1]
+	chargerName := parts[len(parts)-2]
+	
+	// Parse action from payload
+	payloadStr := strings.TrimSpace(string(payload))
+	if payloadStr == "" {
+		h.logger.Warn("Empty payload for command topic", zap.String("topic", topic))
+		return
+	}
+	
+	var action string
+	var cmdReq CommandRequest
+	
+	// Try to parse as JSON first (for set_current with current value)
+	if err := json.Unmarshal(payload, &cmdReq); err == nil && cmdReq.Current > 0 {
+		// JSON with current value = set_current command
+		action = "set_current"
+	} else {
+		// Simple string action (start/stop)
+		action = payloadStr
+		// Try to parse as JSON for response_topic even if it's a string action
+		json.Unmarshal(payload, &cmdReq)
+	}
 
 	span.SetTag("charger", chargerName)
 	span.SetTag("action", action)
-
-	// Parse command request (may include response_topic)
-	var cmdReq CommandRequest
-	if len(payload) > 0 {
-		if err := json.Unmarshal(payload, &cmdReq); err != nil {
-			// If not JSON, treat as empty request (for simple commands like start/stop)
-			cmdReq = CommandRequest{}
-		}
-	}
 
 	// Execute command
 	var resp CommandResponse

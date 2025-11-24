@@ -260,8 +260,50 @@ These topics/fields are published for compatibility with Home Assistant but will
 
 Add to your Home Assistant `configuration.yaml`:
 
+**Control Options:**
+
+**Option 1: Simple Buttons**:
+
 ```yaml
 mqtt:
+  button:
+    # Start charging button
+    - name: "EV Charger Start"
+      unique_id: "ev_charger_start"
+      command_topic: "hems/chargers/garage_wallbox/command"
+      payload_press: "start"
+      icon: "mdi:play"
+    
+    # Stop charging button
+    - name: "EV Charger Stop"
+      unique_id: "ev_charger_stop"
+      command_topic: "hems/chargers/garage_wallbox/command"
+      payload_press: "stop"
+      icon: "mdi:stop"
+```
+
+**Option 2: Switch with State** (shows charging status, no automations needed):
+
+```yaml
+mqtt:
+  switch:
+    - name: "EV Charger Control"
+      unique_id: "ev_charger_control"
+      state_topic: "hems/chargers/garage_wallbox/charging"
+      command_topic: "hems/chargers/garage_wallbox/command"
+      payload_on: "start"
+      payload_off: "stop"
+      state_on: "true"
+      state_off: "false"
+      icon: "mdi:ev-station"
+```
+
+The switch will:
+- Accurately reflect the charging state from `hems/chargers/{name}/charging` topic
+- Send "start" when turned on, "stop" when turned off
+- No automations needed - works directly with Home Assistant's MQTT switch
+  
+  # Optional: Status sensors
   sensor:
     - state_topic: "hems/chargers/garage_wallbox/vehicle_identity"
       name: "EV Charger Vehicle Identity"
