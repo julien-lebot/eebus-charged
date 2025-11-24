@@ -2,10 +2,15 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/julienar/eebus-charged/internal/api"
 	"github.com/julienar/eebus-charged/internal/config"
@@ -33,6 +38,86 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 }
 
+// agentInfo represents the Datadog agent info response
+type agentInfo struct {
+	Version  string `json:"version"`
+	GitCommit string `json:"git_commit"`
+}
+
+// isTraceAgentAccessible tests if a Datadog trace agent is accessible by calling the /info endpoint
+// Similar to C# TraceAgentAccessible - retries 5 times with 5 second delays
+func isTraceAgentAccessible(hostname string, logger *zap.Logger) bool {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	url := fmt.Sprintf("http://%s:8126/info", hostname)
+	
+	retries := 5
+	for retries > 0 {
+		resp, err := client.Get(url)
+		if err != nil {
+			logger.Debug("Failed to connect to Datadog agent", 
+				zap.String("host", hostname), 
+				zap.String("error", err.Error()),
+				zap.Int("retries_left", retries-1))
+			retries--
+			if retries > 0 {
+				time.Sleep(5 * time.Second)
+			}
+			continue
+		}
+		
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			logger.Debug("Datadog agent returned non-200 status", 
+				zap.String("host", hostname),
+				zap.Int("status", resp.StatusCode),
+				zap.Int("retries_left", retries-1))
+			retries--
+			if retries > 0 {
+				time.Sleep(5 * time.Second)
+			}
+			continue
+		}
+		
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			logger.Debug("Failed to read Datadog agent response", 
+				zap.String("host", hostname),
+				zap.Error(err),
+				zap.Int("retries_left", retries-1))
+			retries--
+			if retries > 0 {
+				time.Sleep(5 * time.Second)
+			}
+			continue
+		}
+		
+		var info agentInfo
+		if err := json.Unmarshal(body, &info); err != nil {
+			logger.Debug("Failed to parse Datadog agent info", 
+				zap.String("host", hostname),
+				zap.Error(err),
+				zap.Int("retries_left", retries-1))
+			retries--
+			if retries > 0 {
+				time.Sleep(5 * time.Second)
+			}
+			continue
+		}
+		
+		// Success - agent is accessible
+		logger.Info("Connected to Datadog agent", 
+			zap.String("host", hostname),
+			zap.String("version", info.Version),
+			zap.String("git_commit", info.GitCommit))
+		return true
+	}
+	
+	return false
+}
+
 func runService(cmd *cobra.Command, args []string) error {
 	// Load configuration first
 	cfg, err := config.Load(cfgFile)
@@ -54,16 +139,71 @@ func runService(cmd *cobra.Command, args []string) error {
 
 	// Initialize Datadog tracing if enabled
 	if cfg.Datadog.Enabled {
-		tracer.Start(
-			tracer.WithService(cfg.Datadog.ServiceName),
-			tracer.WithEnv(cfg.Datadog.Environment),
-			tracer.WithAgentAddr(fmt.Sprintf("%s:%d", cfg.Datadog.AgentHost, cfg.Datadog.AgentPort)),
-		)
-		defer tracer.Stop()
-		logger.Info("Datadog tracing initialized",
-			zap.String("service", cfg.Datadog.ServiceName),
-			zap.String("environment", cfg.Datadog.Environment),
-		)
+		// Skip if DD_NO_AGENT is set (like NetdaemonApp)
+		if os.Getenv("DD_NO_AGENT") != "" {
+			logger.Info("Datadog tracing skipped (DD_NO_AGENT is set)")
+		} else {
+			// Support environment variables (DD_AGENT_HOST, DD_TRACE_AGENT_PORT) like NetdaemonApp
+			// These take precedence if set
+			agentHost := cfg.Datadog.AgentHost
+			if envHost := os.Getenv("DD_AGENT_HOST"); envHost != "" {
+				agentHost = envHost
+				logger.Info("Using DD_AGENT_HOST from environment", zap.String("host", envHost))
+			}
+			
+			agentPort := cfg.Datadog.AgentPort
+			if envPort := os.Getenv("DD_TRACE_AGENT_PORT"); envPort != "" {
+				if port, err := strconv.Atoi(envPort); err == nil {
+					agentPort = port
+					logger.Info("Using DD_TRACE_AGENT_PORT from environment", zap.Int("port", port))
+				}
+			}
+			
+			// Test connectivity to agent hosts (like NetdaemonApp)
+			agentHosts := []string{"127.0.0.1", "local-datadog"}
+			if agentHost != "" && agentHost != "localhost" && agentHost != "127.0.0.1" {
+				agentHosts = append([]string{agentHost}, agentHosts...)
+			}
+			
+			var accessibleHost string
+			for _, host := range agentHosts {
+				if isTraceAgentAccessible(host, logger) {
+					accessibleHost = host
+					break
+				}
+			}
+			
+			if accessibleHost == "" {
+				logger.Warn("No accessible Datadog Trace Agent found",
+					zap.Strings("tried_hosts", agentHosts),
+					zap.Int("port", agentPort),
+					zap.String("note", "Tracing will be disabled. Check agent connectivity."))
+			} else {
+				agentAddr := fmt.Sprintf("%s:%d", accessibleHost, agentPort)
+				
+				// Enable debug logging if log level is debug
+				opts := []tracer.StartOption{
+					tracer.WithService(cfg.Datadog.ServiceName),
+					tracer.WithEnv(cfg.Datadog.Environment),
+					tracer.WithAgentAddr(agentAddr),
+				}
+				
+				// Enable debug mode if logging level is debug (helps diagnose connection issues)
+				if cfg.Logging.Level == "debug" {
+					opts = append(opts, tracer.WithDebugMode(true))
+				}
+				
+				tracer.Start(opts...)
+				defer tracer.Stop()
+				
+				logger.Info("Datadog tracing initialized",
+					zap.String("service", cfg.Datadog.ServiceName),
+					zap.String("environment", cfg.Datadog.Environment),
+					zap.String("agent_addr", agentAddr),
+					zap.Bool("debug_mode", cfg.Logging.Level == "debug"),
+				)
+			}
+		}
 	}
 
 	logger.Info("Starting EEBUS HEMS")
