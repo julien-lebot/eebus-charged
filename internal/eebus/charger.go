@@ -7,6 +7,8 @@ import (
 	eebusapi "github.com/enbility/eebus-go/api"
 	ucapi "github.com/enbility/eebus-go/usecases/api"
 	"github.com/enbility/eebus-go/usecases/cem/evcc"
+	"github.com/enbility/eebus-go/usecases/cem/evcem"
+	"github.com/enbility/eebus-go/usecases/cem/evsoc"
 	spineapi "github.com/enbility/spine-go/api"
 	"github.com/julienar/eebus-charged/internal/config"
 	"github.com/julienar/eebus-charged/internal/mqtt"
@@ -43,13 +45,18 @@ type Charger struct {
 	opEV  ucapi.CemOPEVInterface
 	oscEV ucapi.CemOSCEVInterface
 
-	mu                  sync.RWMutex
-	evEntity            spineapi.EntityRemoteInterface
-	currentLimit        float64
-	vehicleID           string
-	isConnected         bool
-	chargingState       ChargingState
-	communicationStandard string // ISO 15118-2, ISO 15118-20, etc.
+	mu                    sync.RWMutex
+	evEntity              spineapi.EntityRemoteInterface
+	currentLimit          float64
+	vehicleID             string
+	isConnected           bool
+	chargingState         ChargingState
+	communicationStandard string                     // ISO 15118-2, ISO 15118-20, etc.
+	manufacturerData      *eebusapi.ManufacturerData // Vehicle manufacturer info
+	sessionEnergy         float64                    // Energy charged in kWh
+	currentPerPhase       []float64                  // Current per phase in A (L1, L2, L3)
+	powerPerPhase         []float64                  // Power per phase in W (L1, L2, L3)
+	vehicleSoC            *float64                   // Vehicle State of Charge (%)
 }
 
 // NewCharger creates a new charger instance
@@ -395,106 +402,245 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 	c.mu.Lock()
 	c.evEntity = entity
-	wasConnected := c.isConnected
+
 	switch event {
 	case evcc.EvConnected:
+		// Vehicle connected - just set the flag, data will come via other events
 		c.logger.Info("Vehicle connected")
 		c.isConnected = true
+
 	case evcc.EvDisconnected:
+		// Vehicle disconnected - clear all state
 		c.logger.Info("Vehicle disconnected")
 		c.evEntity = nil
 		c.isConnected = false
 		c.vehicleID = ""
 		c.chargingState = ChargingStateUnknown
 		c.communicationStandard = ""
+		c.manufacturerData = nil
+		c.sessionEnergy = 0
+		c.currentPerPhase = nil
+		c.powerPerPhase = nil
+		c.vehicleSoC = nil
+
+	case evcc.DataUpdateIdentifications:
+		// Vehicle ID updated
+		c.updateVehicleIdentification()
+
+	case evcc.DataUpdateCommunicationStandard:
+		// Communication standard updated (IEC 61851, ISO 15118-2, ISO 15118-20)
+		c.updateCommunicationStandard()
+
+	case evcc.DataUpdateManufacturerData:
+		// Vehicle manufacturer data updated
+		c.updateManufacturerData()
+
+	case evcc.DataUpdateChargeState:
+		// Charging state changed (active, paused, finished)
+		c.updateChargeState()
+
+	case evcem.DataUpdateCurrentPerPhase:
+		// Current measurements updated
+		c.updateCurrentPerPhase()
+
+	case evcem.DataUpdatePowerPerPhase:
+		// Power measurements updated
+		c.updatePowerPerPhase()
+
+	case evcem.DataUpdateEnergyCharged:
+		// Energy charged updated
+		c.updateSessionEnergy()
+
+	case evsoc.DataUpdateStateOfCharge:
+		// Vehicle SoC updated (ISO 15118-20 or ISO 15118-2 with VAS)
+		c.updateStateOfCharge()
+
+	case evcc.UseCaseSupportUpdate, evcem.UseCaseSupportUpdate, evsoc.UseCaseSupportUpdate:
+		// Use case support changed - log for debugging
+		c.logger.Debug("Use case support updated", zap.String("event", string(event)))
+
 	default:
-		if wasConnected {
-			// Other events like DataUpdateCurrentPerPhase - only update if vehicle was already connected
-			c.updateChargingState()
-		}
+		// Unknown event - log for debugging
+		c.logger.Debug("Unhandled use case event", zap.String("event", string(event)))
 	}
-	
+
 	c.mu.Unlock()
 	c.publishState()
 }
 
-// updateChargingState updates the charging state based on current measurements
-func (c *Charger) updateChargingState() {
-	span := tracer.StartSpan("charger.update_charging_state",
-		tracer.Tag("charger", c.config.Name))
-	defer span.Finish()
-
+// updateVehicleIdentification updates the vehicle ID when it changes
+func (c *Charger) updateVehicleIdentification() {
 	if c.evEntity == nil {
 		return
 	}
 
-	// Try to get vehicle identification (only if we don't have it yet)
-	// Skip empty values - EEBUS may return empty before the actual value is available
-	if c.vehicleID == "" {
-		if identifications, err := c.evCC.Identifications(c.evEntity); err == nil && len(identifications) > 0 {
-			newID := identifications[0].Value
-			if newID != "" {
-				c.vehicleID = newID
-				c.logger.Info("Vehicle identification received",
-					zap.String("vehicle_id", c.vehicleID))
-			}
-		}
-	}
-	
-	// Try to get communication standard (check every time - it can upgrade during session)
-	// e.g., IEC 61851 -> ISO 15118-2 -> ISO 15118-20
-	if commStd, err := c.evCC.CommunicationStandard(c.evEntity); err == nil {
-		newStd := string(commStd)
-		if newStd != "" && newStd != c.communicationStandard {
-			oldStd := c.communicationStandard
-			c.communicationStandard = newStd
-			if oldStd == "" {
-				c.logger.Info("Vehicle communication standard received",
-					zap.String("standard", c.communicationStandard))
-			} else {
-				c.logger.Info("Vehicle communication standard upgraded",
-					zap.String("old_standard", oldStd),
-					zap.String("new_standard", c.communicationStandard))
-			}
-		}
+	identifications, err := c.evCC.Identifications(c.evEntity)
+	if err != nil {
+		return
 	}
 
-	// Try to get the charge state from EVCC
-	if chargeState, err := c.evCC.ChargeState(c.evEntity); err == nil {
-		switch chargeState {
-		case ucapi.EVChargeStateTypeActive:
-			// Check if actually charging by looking at power
-			if c.isActuallyCharging() {
-				c.chargingState = ChargingStateActive
-			} else {
-				c.chargingState = ChargingStateStopped
-			}
-		case ucapi.EVChargeStateTypePaused, ucapi.EVChargeStateTypeFinished:
+	newID := identifications[0].Value
+	if newID != "" && newID != c.vehicleID {
+		c.vehicleID = newID
+		c.logger.Info("Vehicle identification received",
+			zap.String("vehicle_id", c.vehicleID))
+	}
+}
+
+// updateCommunicationStandard updates the communication standard when it changes or upgrades
+func (c *Charger) updateCommunicationStandard() {
+	if c.evEntity == nil {
+		return
+	}
+
+	commStd, err := c.evCC.CommunicationStandard(c.evEntity)
+	if err != nil {
+		return
+	}
+
+	newStd := string(commStd)
+	if newStd != "" && newStd != c.communicationStandard {
+		oldStd := c.communicationStandard
+		c.communicationStandard = newStd
+
+		if oldStd == "" {
+			c.logger.Info("Vehicle communication standard received",
+				zap.String("standard", c.communicationStandard))
+		} else {
+			c.logger.Info("Vehicle communication standard upgraded",
+				zap.String("old_standard", oldStd),
+				zap.String("new_standard", c.communicationStandard))
+		}
+	}
+}
+
+// updateManufacturerData updates vehicle manufacturer information
+func (c *Charger) updateManufacturerData() {
+	if c.evEntity == nil {
+		return
+	}
+
+	mfgData, err := c.evCC.ManufacturerData(c.evEntity)
+	if err != nil {
+		c.logger.Debug("Could not read manufacturer data", zap.Error(err))
+		return
+	}
+
+	c.manufacturerData = &mfgData
+
+	// Log interesting fields if available
+	fields := []zap.Field{}
+	if mfgData.DeviceName != "" {
+		fields = append(fields, zap.String("device_name", mfgData.DeviceName))
+	}
+	if mfgData.BrandName != "" {
+		fields = append(fields, zap.String("brand", mfgData.BrandName))
+	}
+	if mfgData.VendorName != "" {
+		fields = append(fields, zap.String("vendor", mfgData.VendorName))
+	}
+	if mfgData.DeviceCode != "" {
+		fields = append(fields, zap.String("model", mfgData.DeviceCode))
+	}
+	if mfgData.SerialNumber != "" {
+		fields = append(fields, zap.String("serial", mfgData.SerialNumber))
+	}
+	if mfgData.SoftwareRevision != "" {
+		fields = append(fields, zap.String("software", mfgData.SoftwareRevision))
+	}
+
+	if len(fields) > 0 {
+		c.logger.Info("Vehicle manufacturer data received", fields...)
+	}
+}
+
+// updateChargeState updates the charging state when the EV reports state changes
+func (c *Charger) updateChargeState() {
+	if c.evEntity == nil {
+		return
+	}
+
+	chargeState, err := c.evCC.ChargeState(c.evEntity)
+	if err != nil {
+		return
+	}
+
+	switch chargeState {
+	case ucapi.EVChargeStateTypeActive:
+		// Check if actually charging by looking at power
+		if c.isActuallyCharging() {
+			c.chargingState = ChargingStateActive
+		} else {
 			c.chargingState = ChargingStateStopped
-		default:
-			c.chargingState = ChargingStateUnknown
+		}
+	case ucapi.EVChargeStateTypePaused, ucapi.EVChargeStateTypeFinished:
+		c.chargingState = ChargingStateStopped
+	default:
+		c.chargingState = ChargingStateUnknown
+	}
+}
+
+// updateSessionEnergy updates the cached session energy value
+func (c *Charger) updateSessionEnergy() {
+	if c.evEntity == nil {
+		return
+	}
+
+	if c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
+		if energy, err := c.evCem.EnergyCharged(c.evEntity); err == nil {
+			c.sessionEnergy = energy / 1000.0 // Convert Wh to kWh
+		}
+	}
+}
+
+// updateCurrentPerPhase updates the cached current per phase values
+func (c *Charger) updateCurrentPerPhase() {
+	if c.evEntity == nil {
+		return
+	}
+
+	if c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
+		if currents, err := c.evCem.CurrentPerPhase(c.evEntity); err == nil {
+			c.currentPerPhase = currents
+		}
+	}
+}
+
+// updatePowerPerPhase updates the cached power per phase values
+func (c *Charger) updatePowerPerPhase() {
+	if c.evEntity == nil {
+		return
+	}
+
+	if c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
+		if power, err := c.evCem.PowerPerPhase(c.evEntity); err == nil {
+			c.powerPerPhase = power
+		}
+	}
+}
+
+// updateStateOfCharge updates the cached vehicle SoC
+func (c *Charger) updateStateOfCharge() {
+	if c.evEntity == nil {
+		return
+	}
+
+	if c.evSoc.IsScenarioAvailableAtEntity(c.evEntity, 1) {
+		if soc, err := c.evSoc.StateOfCharge(c.evEntity); err == nil {
+			c.vehicleSoC = &soc
+			c.logger.Info("Vehicle SoC updated", zap.Float64("soc", soc))
 		}
 	}
 }
 
 // isActuallyCharging checks if the EV is actually drawing power
 func (c *Charger) isActuallyCharging() bool {
-	if c.evEntity == nil {
-		return false
-	}
-
-	// Check if we can get current measurements
-	if !c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
-		return false
-	}
-
-	currents, err := c.evCem.CurrentPerPhase(c.evEntity)
-	if err != nil || len(currents) == 0 {
+	if len(c.currentPerPhase) == 0 {
 		return false
 	}
 
 	// Consider charging if any phase has significant current (>1A)
-	for _, current := range currents {
+	for _, current := range c.currentPerPhase {
 		if current > 1.0 {
 			return true
 		}
@@ -515,31 +661,17 @@ func (c *Charger) publishState() {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// Get current power
+	// Calculate total power from cached measurements
 	var chargePower float64
-	if c.evEntity != nil && c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
-		if currents, err := c.evCem.CurrentPerPhase(c.evEntity); err == nil {
-			// Calculate total power (sum of all phases)
-			for _, current := range currents {
-				chargePower += current * voltage // W = A * V
-			}
+	if len(c.powerPerPhase) > 0 {
+		// Use cached power measurements if available
+		for _, power := range c.powerPerPhase {
+			chargePower += power
 		}
-	}
-
-	// Try to get vehicle SoC (only works with ISO 15118-20 or ISO 15118-2 with VAS)
-	var vehicleSoC *float64
-	if c.evEntity != nil && c.evSoc.IsScenarioAvailableAtEntity(c.evEntity, 1) {
-		if soc, err := c.evSoc.StateOfCharge(c.evEntity); err == nil {
-			vehicleSoC = &soc
-			c.logger.Info("Vehicle SoC available", zap.Float64("soc", soc))
-		}
-	}
-
-	// Try to get energy charged (available if charger supports EVCEM)
-	var sessionEnergy float64
-	if c.evEntity != nil && c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
-		if energy, err := c.evCem.EnergyCharged(c.evEntity); err == nil {
-			sessionEnergy = energy / 1000.0 // Convert Wh to kWh
+	} else if len(c.currentPerPhase) > 0 {
+		// Fallback: calculate from current (I × V)
+		for _, current := range c.currentPerPhase {
+			chargePower += current * voltage
 		}
 	}
 
@@ -559,8 +691,8 @@ func (c *Charger) publishState() {
 		ChargingState:     string(c.chargingState),
 		ChargePower:       chargePower,
 		CurrentLimit:      c.currentLimit,
-		SessionEnergy:     sessionEnergy, // Energy charged in kWh from EVCEM
-		VehicleSoC:        vehicleSoC, // Available with ISO 15118-20 or ISO 15118-2 with VAS
+		SessionEnergy:     c.sessionEnergy, // Cached from DataUpdateEnergyCharged events
+		VehicleSoC:        c.vehicleSoC, // Cached from DataUpdateStateOfCharge events
 		ChargeRemainingEnergy: nil, // Not available from ISO 15118
 	}
 
