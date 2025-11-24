@@ -535,6 +535,14 @@ func (c *Charger) publishState() {
 		}
 	}
 
+	// Try to get energy charged (available if charger supports EVCEM)
+	var sessionEnergy float64
+	if c.evEntity != nil && c.evCem.IsScenarioAvailableAtEntity(c.evEntity, 1) {
+		if energy, err := c.evCem.EnergyCharged(c.evEntity); err == nil {
+			sessionEnergy = energy / 1000.0 // Convert Wh to kWh
+		}
+	}
+
 	// Get friendly vehicle name from config if available
 	vehicleName := ""
 	if c.vehicleNames != nil && c.vehicleID != "" {
@@ -551,7 +559,7 @@ func (c *Charger) publishState() {
 		ChargingState:     string(c.chargingState),
 		ChargePower:       chargePower,
 		CurrentLimit:      c.currentLimit,
-		SessionEnergy:     0, // ISO 15118-2 doesn't provide session energy
+		SessionEnergy:     sessionEnergy, // Energy charged in kWh from EVCEM
 		VehicleSoC:        vehicleSoC, // Available with ISO 15118-20 or ISO 15118-2 with VAS
 		ChargeRemainingEnergy: nil, // Not available from ISO 15118
 	}
