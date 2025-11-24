@@ -34,7 +34,7 @@ type Service struct {
 	config  *config.Config
 	logger  *zap.Logger
 	service eebusapi.ServiceInterface
-	mqttPub *mqtt.Publisher
+	mqttHandler *mqtt.MqttHandler
 
 	// Use cases
 	evCC  ucapi.CemEVCCInterface  // EV Charging Control
@@ -49,14 +49,14 @@ type Service struct {
 }
 
 // NewService creates a new EEBUS service instance
-func NewService(cfg *config.Config, logger *zap.Logger, mqttPub *mqtt.Publisher) (*Service, error) {
+func NewService(cfg *config.Config, logger *zap.Logger, mqttHandler *mqtt.MqttHandler) (*Service, error) {
 	span := tracer.StartSpan("eebus.new_service")
 	defer span.Finish()
 
 	s := &Service{
 		config:            cfg,
 		logger:            logger,
-		mqttPub:           mqttPub,
+		mqttHandler:       mqttHandler,
 		chargers:          make(map[string]*Charger),
 		discoveredDevices: make(map[string]shipapi.RemoteService),
 	}
@@ -158,6 +158,9 @@ func (s *Service) Start() error {
 	// Start the service
 	s.service.Start()
 
+	// Publish initial charger list (for configured chargers that may already be connected)
+	s.publishChargerList()
+
 	s.logger.Info("EEBUS service started successfully")
 	return nil
 }
@@ -192,6 +195,35 @@ func (s *Service) ListChargers() []*Charger {
 	}
 
 	return chargers
+}
+
+// CommandHandler implementation for MQTT commands
+
+// HandleStart starts charging on the specified charger
+func (s *Service) HandleStart(chargerName string) error {
+	charger, err := s.GetCharger(chargerName)
+	if err != nil {
+		return err
+	}
+	return charger.StartCharging()
+}
+
+// HandleStop stops charging on the specified charger
+func (s *Service) HandleStop(chargerName string) error {
+	charger, err := s.GetCharger(chargerName)
+	if err != nil {
+		return err
+	}
+	return charger.StopCharging()
+}
+
+// HandleSetCurrent sets the current limit on the specified charger
+func (s *Service) HandleSetCurrent(chargerName string, current float64) error {
+	charger, err := s.GetCharger(chargerName)
+	if err != nil {
+		return err
+	}
+	return charger.SetCurrentLimit(current)
 }
 
 // ensureCertificates generates certificates if they don't exist
@@ -487,31 +519,61 @@ func (s *Service) findChargerBySKI(ski string) (*Charger, bool) {
 // addCharger adds a charger to the service
 func (s *Service) addCharger(cfg config.ChargerConfig, device spineapi.DeviceRemoteInterface) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	charger := NewCharger(cfg, device, s.logger, &s.config.Charging, s.evCC, s.evCem, s.evSoc, s.opEV, s.oscEV, s.mqttPub)
+	charger := NewCharger(cfg, device, s.logger, &s.config.Charging, s.evCC, s.evCem, s.evSoc, s.opEV, s.oscEV, s.mqttHandler)
 	s.chargers[cfg.Name] = charger
+	s.mu.Unlock()
 
 	s.logger.Info("Charger added",
 		zap.String("name", cfg.Name),
 		zap.String("ski", device.Ski()),
 	)
+
+	// Publish updated charger list
+	s.publishChargerList()
 }
 
 // removeCharger removes a charger from the service
 func (s *Service) removeCharger(ski string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	var removedName string
 	for name, charger := range s.chargers {
 		if charger.device.Ski() == ski {
 			delete(s.chargers, name)
-			s.logger.Info("Charger removed",
-				zap.String("name", name),
-				zap.String("ski", ski),
-			)
-			return
+			removedName = name
+			break
 		}
+	}
+	s.mu.Unlock()
+
+	if removedName != "" {
+		s.logger.Info("Charger removed",
+			zap.String("name", removedName),
+			zap.String("ski", ski),
+		)
+		// Publish updated charger list
+		s.publishChargerList()
+	}
+}
+
+// publishChargerList publishes the list of available chargers to MQTT
+func (s *Service) publishChargerList() {
+	if s.mqttHandler == nil {
+		return
+	}
+
+	s.mu.RLock()
+	chargerInfos := make([]mqtt.ChargerInfo, 0, len(s.chargers))
+	for name, charger := range s.chargers {
+		chargerInfos = append(chargerInfos, mqtt.ChargerInfo{
+			Name:      name,
+			SKI:       charger.SKI(),
+			Connected: charger.IsConnected(),
+		})
+	}
+	s.mu.RUnlock()
+
+	if err := s.mqttHandler.PublishChargerList(chargerInfos); err != nil {
+		s.logger.Warn("Failed to publish charger list", zap.Error(err))
 	}
 }
 

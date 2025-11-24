@@ -33,7 +33,7 @@ type Charger struct {
 	chargingCfg *config.ChargingConfig
 	device      spineapi.DeviceRemoteInterface
 	logger      *zap.Logger
-	mqttPub     *mqtt.Publisher
+	mqttHandler *mqtt.MqttHandler
 
 	// EEBUS use cases
 	evCC  ucapi.CemEVCCInterface
@@ -61,14 +61,14 @@ func NewCharger(
 	evSoc ucapi.CemEVSOCInterface,
 	opEV ucapi.CemOPEVInterface,
 	oscEV ucapi.CemOSCEVInterface,
-	mqttPub *mqtt.Publisher,
+	mqttHandler *mqtt.MqttHandler,
 ) *Charger {
 	return &Charger{
 		config:        cfg,
 		chargingCfg:   chargingCfg,
 		device:        device,
 		logger:        logger.With(zap.String("charger", cfg.Name)),
-		mqttPub:       mqttPub,
+		mqttHandler:  mqttHandler,
 		evCC:          evCC,
 		evCem:         evCem,
 		evSoc:         evSoc,
@@ -479,7 +479,7 @@ func (c *Charger) isActuallyCharging() bool {
 
 // publishState publishes the current charger state to MQTT
 func (c *Charger) publishState() {
-	if c.mqttPub == nil {
+	if c.mqttHandler == nil {
 		return
 	}
 
@@ -522,7 +522,7 @@ func (c *Charger) publishState() {
 		ChargeRemainingEnergy: nil, // Not available from ISO 15118
 	}
 
-	if err := c.mqttPub.PublishChargerState(c.config.Name, state); err != nil {
+	if err := c.mqttHandler.PublishChargerState(c.config.Name, state); err != nil {
 		c.logger.Warn("Failed to publish MQTT state", zap.Error(err))
 	}
 }

@@ -75,10 +75,10 @@ func runService(cmd *cobra.Command, args []string) error {
 		zap.Bool("datadog_enabled", cfg.Datadog.Enabled),
 	)
 
-	// Initialize MQTT publisher if enabled
-	var mqttPub *mqtt.Publisher
+	// Initialize MQTT handler if enabled
+	var mqttHandler *mqtt.MqttHandler
 	if cfg.MQTT.Enabled {
-		mqttPub, err = mqtt.NewPublisher(
+		mqttHandler, err = mqtt.NewMqttHandler(
 			cfg.MQTT.Broker,
 			cfg.MQTT.Port,
 			cfg.MQTT.Username,
@@ -90,17 +90,25 @@ func runService(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize MQTT publisher: %w", err)
 		}
-		defer mqttPub.Close()
-		logger.Info("MQTT publisher initialized",
+		defer mqttHandler.Close()
+		logger.Info("MQTT handler initialized",
 			zap.String("broker", cfg.MQTT.Broker),
 			zap.String("topic_prefix", cfg.MQTT.TopicPrefix),
 		)
 	}
 
 	// Create EEBUS service
-	service, err := eebus.NewService(cfg, logger, mqttPub)
+	service, err := eebus.NewService(cfg, logger, mqttHandler)
 	if err != nil {
 		return fmt.Errorf("failed to create EEBUS service: %w", err)
+	}
+
+	// Subscribe to MQTT commands if enabled
+	if cfg.MQTT.Enabled && mqttHandler != nil {
+		if err := mqttHandler.SubscribeToCommands(service); err != nil {
+			return fmt.Errorf("failed to subscribe to MQTT commands: %w", err)
+		}
+		logger.Info("MQTT command subscription enabled")
 	}
 
 	// Start service
