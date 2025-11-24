@@ -395,15 +395,12 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 		// Automatically stop charging when vehicle connects
 		// User must explicitly call StartCharging() to begin charging
-		if err := c.writeCurrentLimit(entity, 0); err != nil {
+		// Note: c.evEntity is already set above, so StopCharging() will work
+		if err := c.StopCharging(); err != nil {
 			c.logger.Warn("Failed to stop charging on connect", zap.Error(err))
 		} else {
-			c.mu.Lock()
-			c.chargingState = ChargingStateStopped
-			c.mu.Unlock()
 			c.logger.Info("Vehicle connected - charging stopped (call start to begin)")
 		}
-		c.publishState()
 
 	case evcc.EvDisconnected:
 		// EV disconnected
