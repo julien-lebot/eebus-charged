@@ -5,8 +5,11 @@ Standalone EEBUS-based charger control system for controlling EV chargers.
 ## Features
 
 - Direct EEBUS communication with compatible chargers (Porsche Mobile Charger Connect, Elli, etc.)
+- **Smart protocol handling** - automatically detects and uses the best charging protocol:
+  - IEC 61851 basic mode
+  - ISO 15118-2 with VW/Porsche VAS support for seamless pause/resume
 - **Auto-stop on vehicle connect** - prevents unwanted charging until you're ready
-- Start and stop charging via API/CLI
+- Start, stop, and pause charging via API/CLI
 - Set charging current dynamically
 - Vehicle identification (ISO 15118)
 - Multi-charger support with auto-discovery

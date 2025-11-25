@@ -52,6 +52,7 @@ type Charger struct {
 	isConnected           bool
 	chargingState         ChargingState
 	communicationStandard string                     // ISO 15118-2, ISO 15118-20, etc.
+	controller            ChargingController         // Created when first charge state received (protocol ready)
 	manufacturerData      *eebusapi.ManufacturerData // Vehicle manufacturer info
 	sessionEnergy         float64                    // Energy charged in kWh
 	currentPerPhase       []float64                  // Current per phase in A (L1, L2, L3)
@@ -287,111 +288,38 @@ func (c *Charger) GetStatus() map[string]interface{} {
 }
 
 // writeCurrentLimit writes the current limit to the EV via EEBUS
+// Delegates to the communication-standard-specific controller
 func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, current float64) error {
 	span := tracer.StartSpan("charger.write_current_limit",
 		tracer.Tag("charger", c.config.Name),
 		tracer.Tag("current", current))
 	defer span.Finish()
 
-	// Check if overload protection is available
-	if !c.opEV.IsScenarioAvailableAtEntity(evEntity, 1) {
-		span.SetTag("error", "overload protection not available")
-		return fmt.Errorf("overload protection not available")
+	// Controller is created when first charge state arrives (protocol ready)
+	// If controller doesn't exist yet, protocol is still negotiating
+	if c.controller == nil {
+		span.SetTag("deferred", true)
+		c.logger.Info("Protocol negotiation in progress, deferring limit write",
+			zap.Float64("current", current),
+			zap.String("standard", c.communicationStandard))
+		return fmt.Errorf("protocol negotiation in progress - controller will be created when ready")
 	}
 
-	// Get current limits from EVSE to know what's possible
-	// This may fail if data isn't available yet - that's OK, we'll still try to write limits
-	_, maxLimits, _, err := c.opEV.CurrentLimits(evEntity)
-	if err != nil {
-		c.logger.Debug("Could not get current limits from EVSE (data may not be available yet)", zap.Error(err))
-		// Continue anyway - we'll set limits without max limit validation
-		maxLimits = nil
-	}
-
-	// Setup the limit data for all phases
-	var limits []ucapi.LoadLimitsPhase
-	for phase := 0; phase < c.chargingCfg.Phases; phase++ {
-		limit := ucapi.LoadLimitsPhase{
-			Phase:    ucapi.PhaseNameMapping[phase],
-			IsActive: true,
-			Value:    current,
-		}
-
-		// If the limit equals or exceeds the max allowed, the limit is inactive
-		// Only do this if we successfully got maxLimits
-		if maxLimits != nil && phase < len(maxLimits) && current >= maxLimits[phase] {
-			limit.IsActive = false
-		}
-
-		limits = append(limits, limit)
-	}
-
-	// Disable optimization of self consumption limits if they exist
-	if c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1) {
-		if _, err := c.oscEV.LoadControlLimits(evEntity); err == nil {
-			// Make sure the OSCEV limits are inactive
-			if err := c.disableLimits(evEntity, c.oscEV); err != nil {
-				c.logger.Warn("Failed to disable OSCEV limits", zap.Error(err))
-			}
-		}
-	}
-
-	// Write the overload protection limits
-	_, err = c.opEV.WriteLoadControlLimits(evEntity, limits, nil)
-	if err != nil {
-		span.SetTag("error", err.Error())
-		return fmt.Errorf("failed to write load control limits: %w", err)
-	}
-
-	c.logger.Debug("Current limit written to EV",
-		zap.Float64("current", current),
-		zap.Int("phases", len(limits)),
-	)
-
-	return nil
-}
-
-// disableLimits disables all limits for a given use case
-func (c *Charger) disableLimits(evEntity spineapi.EntityRemoteInterface, uc interface{}) error {
-	span := tracer.StartSpan("charger.disable_limits",
-		tracer.Tag("charger", c.config.Name))
-	defer span.Finish()
-
-	type limitController interface {
-		LoadControlLimits(spineapi.EntityRemoteInterface) ([]ucapi.LoadLimitsPhase, error)
-		WriteLoadControlLimits(spineapi.EntityRemoteInterface, []ucapi.LoadLimitsPhase, func(result any)) (*uint64, error)
-	}
-
-	controller, ok := uc.(limitController)
-	if !ok {
-		span.SetTag("error", "use case does not support load control limits")
-		return fmt.Errorf("use case does not support load control limits")
-	}
-
-	limits, err := controller.LoadControlLimits(evEntity)
+	// Delegate to the controller
+	err := c.controller.WriteCurrentLimit(evEntity, current)
 	if err != nil {
 		span.SetTag("error", err.Error())
 		return err
 	}
 
-	// Check if any limits are active
-	var writeNeeded bool
-	for index, limit := range limits {
-		if limit.IsActive {
-			limits[index].IsActive = false
-			writeNeeded = true
-		}
-	}
+	c.logger.Debug("Current limit written via controller",
+		zap.Float64("current", current),
+		zap.String("controller", c.controller.Name()),
+	)
 
-	if writeNeeded {
-		_, err = controller.WriteLoadControlLimits(evEntity, limits, nil)
-		if err != nil {
-			span.SetTag("error", err.Error())
-		}
-	}
-
-	return err
+	return nil
 }
+
 
 // handleUseCaseEvent handles EEBUS use case events
 func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, entity spineapi.EntityRemoteInterface, event eebusapi.EventType) {
@@ -417,6 +345,7 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		c.vehicleID = ""
 		c.chargingState = ChargingStateUnknown
 		c.communicationStandard = ""
+		c.controller = nil
 		c.manufacturerData = nil
 		c.sessionEnergy = 0
 		c.currentPerPhase = nil
@@ -437,6 +366,20 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 	case evcc.DataUpdateChargeState:
 		// Charging state changed (active, paused, finished)
+		// Create controller when first charge state arrives (indicates protocol is ready)
+		if c.controller == nil && c.communicationStandard != "" {
+			c.controller = createController(
+				c.communicationStandard,
+				c.chargingCfg,
+				c.evCC,
+				c.opEV,
+				c.oscEV,
+				c.logger,
+			)
+			c.logger.Info("Protocol negotiation complete - controller created",
+				zap.String("standard", c.communicationStandard),
+				zap.String("controller", c.controller.Name()))
+		}
 		c.updateChargeState()
 
 	case evcem.DataUpdateCurrentPerPhase:
@@ -510,6 +453,31 @@ func (c *Charger) updateCommunicationStandard() {
 			c.logger.Info("Vehicle communication standard upgraded",
 				zap.String("old_standard", oldStd),
 				zap.String("new_standard", c.communicationStandard))
+			
+			// Recreate controller for upgraded protocol
+			// This handles the transition from IEC61851 to ISO15118-2
+			if c.controller != nil {
+				c.controller = createController(
+					c.communicationStandard,
+					c.chargingCfg,
+					c.evCC,
+					c.opEV,
+					c.oscEV,
+					c.logger,
+				)
+				c.logger.Info("Controller recreated for upgraded protocol",
+					zap.String("controller", c.controller.Name()))
+				
+				// Re-apply current limits with new controller
+				if c.evEntity != nil {
+					c.logger.Info("Re-applying limits with upgraded controller",
+						zap.Float64("current", c.currentLimit))
+					
+					if err := c.writeCurrentLimit(c.evEntity, c.currentLimit); err != nil {
+						c.logger.Warn("Failed to re-apply limits after protocol upgrade", zap.Error(err))
+					}
+				}
+			}
 		}
 	}
 }
