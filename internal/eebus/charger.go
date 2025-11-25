@@ -295,14 +295,14 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 		tracer.Tag("current", current))
 	defer span.Finish()
 
-	// Controller is created when first charge state arrives (protocol ready)
+	// Controller is created when communication standard is received
 	// If controller doesn't exist yet, protocol is still negotiating
 	if c.controller == nil {
 		span.SetTag("deferred", true)
 		c.logger.Info("Protocol negotiation in progress, deferring limit write",
 			zap.Float64("current", current),
 			zap.String("standard", c.communicationStandard))
-		return fmt.Errorf("protocol negotiation in progress - controller will be created when ready")
+		return fmt.Errorf("protocol negotiation in progress - controller will be created when standard is known")
 	}
 
 	// Delegate to the controller
@@ -366,20 +366,6 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 	case evcc.DataUpdateChargeState:
 		// Charging state changed (active, paused, finished)
-		// Create controller when first charge state arrives (indicates protocol is ready)
-		if c.controller == nil && c.communicationStandard != "" {
-			c.controller = createController(
-				c.communicationStandard,
-				c.chargingCfg,
-				c.evCC,
-				c.opEV,
-				c.oscEV,
-				c.logger,
-			)
-			c.logger.Info("Protocol negotiation complete - controller created",
-				zap.String("standard", c.communicationStandard),
-				zap.String("controller", c.controller.Name()))
-		}
 		c.updateChargeState()
 
 	case evcem.DataUpdateCurrentPerPhase:
@@ -445,6 +431,22 @@ func (c *Charger) updateCommunicationStandard() {
 	if newStd != "" && newStd != c.communicationStandard {
 		oldStd := c.communicationStandard
 		c.communicationStandard = newStd
+
+		// Create controller when communication standard is known
+		// Don't wait for charge state - protocol is ready when standard is received
+		if c.controller == nil && c.evEntity != nil {
+			c.controller = createController(
+				c.communicationStandard,
+				c.chargingCfg,
+				c.evCC,
+				c.opEV,
+				c.oscEV,
+				c.logger,
+			)
+			c.logger.Info("Controller created for communication standard",
+				zap.String("standard", c.communicationStandard),
+				zap.String("controller", c.controller.Name()))
+		}
 
 		if oldStd == "" {
 			c.logger.Info("Vehicle communication standard received",
