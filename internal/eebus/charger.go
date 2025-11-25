@@ -700,16 +700,3 @@ func (c *Charger) publishState() {
 		c.logger.Warn("Failed to publish MQTT state", zap.Error(err))
 	}
 }
-
-// MonitorCharging can be called periodically to update state
-func (c *Charger) MonitorCharging() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.evEntity == nil {
-		return
-	}
-
-	c.updateChargingState()
-}
-
