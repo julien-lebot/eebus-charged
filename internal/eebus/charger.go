@@ -528,10 +528,15 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 	case evcem.DataUpdateCurrentPerPhase:
 		// Current measurements updated
 		c.updateCurrentPerPhase()
+		// Re-evaluate charging state based on new current measurements
+		// This is especially important in IEC 61851 mode where EVCC charge state may not be available
+		c.updateChargeState()
 
 	case evcem.DataUpdatePowerPerPhase:
 		// Power measurements updated
 		c.updatePowerPerPhase()
+		// Re-evaluate charging state based on new power measurements
+		c.updateChargeState()
 
 	case evcem.DataUpdateEnergyCharged:
 		// Energy charged updated
