@@ -2,6 +2,7 @@ package eebus
 
 import (
 	"fmt"
+	"math"
 	"sync"
 
 	eebusapi "github.com/enbility/eebus-go/api"
@@ -69,6 +70,7 @@ type Charger struct {
 	oscEVMinLimits        []float64                  // OSCEV min limits per phase
 	oscEVMaxLimits        []float64                  // OSCEV max limits per phase
 	oscEVDefaultLimits    []float64                  // OSCEV default limits per phase
+	limitsReceived        bool                       // Whether we've received actual limits from charger/vehicle
 }
 
 // NewCharger creates a new charger instance
@@ -200,7 +202,6 @@ func (c *Charger) StopCharging() error {
 	return nil
 }
 
-
 // SetCurrentLimit sets the maximum charging current in Amperes
 func (c *Charger) SetCurrentLimit(current float64) error {
 	span := tracer.StartSpan("charger.set_current_limit",
@@ -215,49 +216,29 @@ func (c *Charger) SetCurrentLimit(current float64) error {
 
 	c.mu.RLock()
 	evEntity := c.evEntity
+	limitsReceived := c.limitsReceived
+	// Get effective limits (must be called with lock held)
+	effectiveMin, effectiveMax := c.getEffectiveLimits()
 	c.mu.RUnlock()
-
-	// Get EV limits if vehicle is connected
-	var evMinAmps, evMaxAmps float64
-	if evEntity != nil {
-		minWatts, maxWatts, _, err := c.evCC.ChargingPowerLimits(evEntity)
-		if err == nil {
-			// Convert watts to amps (230V per phase * N phases)
-			evMinAmps = minWatts / (230.0 * float64(c.chargingCfg.Phases))
-			evMaxAmps = maxWatts / (230.0 * float64(c.chargingCfg.Phases))
-			c.logger.Debug("EV current limits",
-				zap.Float64("ev_min_amps", evMinAmps),
-				zap.Float64("ev_max_amps", evMaxAmps))
-		}
-	}
-
-	// Determine effective min/max (most restrictive of EV limits and config limits)
-	effectiveMin := c.chargingCfg.MinCurrent
-	effectiveMax := c.chargingCfg.MaxCurrent
-	if evEntity != nil && evMinAmps > 0 && evMinAmps > effectiveMin {
-		effectiveMin = evMinAmps
-		c.logger.Debug("Using EV minimum", zap.Float64("ev_min", evMinAmps))
-	}
-	if evEntity != nil && evMaxAmps > 0 && evMaxAmps < effectiveMax {
-		effectiveMax = evMaxAmps
-		c.logger.Debug("Using EV maximum", zap.Float64("ev_max", evMaxAmps))
+	
+	// If vehicle is connected but we haven't received limits yet, return error
+	if evEntity != nil && !limitsReceived {
+		return fmt.Errorf("cannot set current limit: actual limits from charger/vehicle not yet received")
 	}
 
 	// Validate and clamp to effective limits
 	if current > 0 && current < effectiveMin {
-		c.logger.Warn("Requested current below minimum, using minimum",
+		c.logger.Warn("Requested current below minimum, clamping to minimum",
 			zap.Float64("requested", current),
-			zap.Float64("minimum", effectiveMin),
-			zap.Bool("ev_connected", evEntity != nil))
+			zap.Float64("minimum", effectiveMin))
 		current = effectiveMin
 	}
 
 	if current > effectiveMax {
-		c.logger.Warn("Requested current above maximum, using maximum",
+		c.logger.Warn("Requested current above maximum, clamping to maximum",
 			zap.Float64("requested", current),
-			zap.Float64("maximum", effectiveMax),
-			zap.Bool("ev_connected", evEntity != nil))
-		current = effectiveMax
+			zap.Float64("maximum", effectiveMax))
+		current = math.Min(current, effectiveMax)
 	}
 
 	c.mu.Lock()
@@ -277,10 +258,74 @@ func (c *Charger) SetCurrentLimit(current float64) error {
 	return nil
 }
 
+// getEffectiveLimits returns the effective min/max current limits
+// Min: ONLY from actual detected min from charger/vehicle (0 if not received yet)
+// Max: min(config_max, actual_detected_max) - config_max if not received yet
+// Must be called with mu lock held (RLock or Lock)
+func (c *Charger) getEffectiveLimits() (minCurrent, maxCurrent float64) {
+	// Max current always uses config as upper bound
+	maxCurrent = c.chargingCfg.MaxCurrent
+	
+	// Min current is 0 until we receive actual limits
+	minCurrent = 0
+
+	// If we haven't received actual limits yet, return early
+	if !c.limitsReceived {
+		return minCurrent, maxCurrent
+	}
+
+	// Get actual limits from cached OPEV/OSCEV data
+	// Use the maximum min and maximum max across all phases
+	var actualMin, actualMax float64
+
+	// Check OPEV limits first (obligations - more authoritative)
+	if len(c.opEVMinLimits) > 0 && len(c.opEVMaxLimits) > 0 {
+		for i := 0; i < len(c.opEVMinLimits) && i < len(c.opEVMaxLimits); i++ {
+			// Find minimum of min limits (smallest value across phases)
+			if actualMin == 0 || c.opEVMinLimits[i] < actualMin {
+				actualMin = c.opEVMinLimits[i]
+			}
+			// Find maximum of max limits (largest value across phases)
+			if c.opEVMaxLimits[i] > actualMax {
+				actualMax = c.opEVMaxLimits[i]
+			}
+		}
+	}
+
+	// Also check OSCEV limits if OPEV not available
+	if actualMin == 0 && actualMax == 0 && len(c.oscEVMinLimits) > 0 && len(c.oscEVMaxLimits) > 0 {
+		for i := 0; i < len(c.oscEVMinLimits) && i < len(c.oscEVMaxLimits); i++ {
+			// Find minimum of min limits (smallest value across phases)
+			if actualMin == 0 || c.oscEVMinLimits[i] < actualMin {
+				actualMin = c.oscEVMinLimits[i]
+			}
+			// Find maximum of max limits (largest value across phases)
+			if c.oscEVMaxLimits[i] > actualMax {
+				actualMax = c.oscEVMaxLimits[i]
+			}
+		}
+	}
+
+	// Apply actual limits
+	if actualMin > 0 {
+		minCurrent = actualMin
+	}
+	if actualMax > 0 {
+		// Use the smaller of config max and actual max
+		if actualMax < maxCurrent {
+			maxCurrent = actualMax
+		}
+	}
+
+	return minCurrent, maxCurrent
+}
+
 // GetStatus returns detailed status information
 func (c *Charger) GetStatus() map[string]interface{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	effectiveMin, effectiveMax := c.getEffectiveLimits()
 
 	status := map[string]interface{}{
 		"name":           c.config.Name,
@@ -288,8 +333,8 @@ func (c *Charger) GetStatus() map[string]interface{} {
 		"connected":      c.isConnected,
 		"charging_state": string(c.chargingState),
 		"current_limit":  c.currentLimit,
-		"min_current":    c.chargingCfg.MinCurrent,
-		"max_current":    c.chargingCfg.MaxCurrent,
+		"min_current":    effectiveMin,
+		"max_current":    effectiveMax,
 	}
 
 	if c.isConnected {
@@ -305,55 +350,11 @@ func (c *Charger) GetStatus() map[string]interface{} {
 		status["communication_standard"] = capabilities.CommunicationStandard
 		status["controller_type"] = capabilities.ControllerType
 		
-		// VAS feature
+		// VAS feature (only for ISO 15118-2ed2)
 		if capabilities.VASSupported != nil {
 			features["vas"] = map[string]interface{}{
 				"supported": *capabilities.VASSupported,
 			}
-		}
-		
-		// OSCEV feature
-		if capabilities.OSCEVAvailable != nil {
-			oscevFeature := map[string]interface{}{
-				"supported": *capabilities.OSCEVAvailable,
-			}
-			// Add limits if available
-			if len(c.oscEVMinLimits) > 0 || len(c.oscEVMaxLimits) > 0 {
-				limits := map[string]interface{}{}
-				if len(c.oscEVMinLimits) > 0 {
-					limits["min"] = c.oscEVMinLimits
-				}
-				if len(c.oscEVMaxLimits) > 0 {
-					limits["max"] = c.oscEVMaxLimits
-				}
-				if len(c.oscEVDefaultLimits) > 0 {
-					limits["default"] = c.oscEVDefaultLimits
-				}
-				oscevFeature["limits"] = limits
-			}
-			features["oscev"] = oscevFeature
-		}
-		
-		// OPEV feature
-		if capabilities.OPEVAvailable != nil {
-			opevFeature := map[string]interface{}{
-				"supported": *capabilities.OPEVAvailable,
-			}
-			// Add limits if available
-			if len(c.opEVMinLimits) > 0 || len(c.opEVMaxLimits) > 0 {
-				limits := map[string]interface{}{}
-				if len(c.opEVMinLimits) > 0 {
-					limits["min"] = c.opEVMinLimits
-				}
-				if len(c.opEVMaxLimits) > 0 {
-					limits["max"] = c.opEVMaxLimits
-				}
-				if len(c.opEVDefaultLimits) > 0 {
-					limits["default"] = c.opEVDefaultLimits
-				}
-				opevFeature["limits"] = limits
-			}
-			features["opev"] = opevFeature
 		}
 		
 		// Asymmetric charging feature
@@ -366,6 +367,58 @@ func (c *Charger) GetStatus() map[string]interface{} {
 		// Protocol known but controller not yet created
 		status["communication_standard"] = c.communicationStandard
 		status["controller_type"] = "pending"
+	}
+	
+	// Always show OSCEV feature if we have limits from hardware
+	if len(c.oscEVMinLimits) > 0 || len(c.oscEVMaxLimits) > 0 || len(c.oscEVDefaultLimits) > 0 {
+		oscevFeature := map[string]interface{}{}
+		
+		// Check if OSCEV is actually supported by querying the entity
+		if c.evEntity != nil && c.oscEV != nil {
+			oscevFeature["supported"] = c.oscEV.IsScenarioAvailableAtEntity(c.evEntity, 1)
+		} else {
+			oscevFeature["supported"] = false
+		}
+		
+		// Add limits
+		limits := map[string]interface{}{}
+		if len(c.oscEVMinLimits) > 0 {
+			limits["min"] = c.oscEVMinLimits
+		}
+		if len(c.oscEVMaxLimits) > 0 {
+			limits["max"] = c.oscEVMaxLimits
+		}
+		if len(c.oscEVDefaultLimits) > 0 {
+			limits["default"] = c.oscEVDefaultLimits
+		}
+		oscevFeature["limits"] = limits
+		features["oscev"] = oscevFeature
+	}
+	
+	// Always show OPEV feature if we have limits from hardware
+	if len(c.opEVMinLimits) > 0 || len(c.opEVMaxLimits) > 0 || len(c.opEVDefaultLimits) > 0 {
+		opevFeature := map[string]interface{}{}
+		
+		// Check if OPEV is actually supported by querying the entity
+		if c.evEntity != nil && c.opEV != nil {
+			opevFeature["supported"] = c.opEV.IsScenarioAvailableAtEntity(c.evEntity, 1)
+		} else {
+			opevFeature["supported"] = false
+		}
+		
+		// Add limits
+		limits := map[string]interface{}{}
+		if len(c.opEVMinLimits) > 0 {
+			limits["min"] = c.opEVMinLimits
+		}
+		if len(c.opEVMaxLimits) > 0 {
+			limits["max"] = c.opEVMaxLimits
+		}
+		if len(c.opEVDefaultLimits) > 0 {
+			limits["default"] = c.opEVDefaultLimits
+		}
+		opevFeature["limits"] = limits
+		features["opev"] = opevFeature
 	}
 	
 	// Add features to status if any exist
@@ -487,9 +540,8 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		// This allows the controller to re-check VAS support and switch modes if it becomes available
 		if event == oscev.UseCaseSupportUpdate && c.controller != nil && c.evEntity != nil {
 			c.logger.Info("OSCEV use case support updated - re-applying current limit to check for VAS support")
-			c.mu.RLock()
+			// No lock needed - we already hold c.mu.Lock() from line 473
 			currentLimit := c.currentLimit
-			c.mu.RUnlock()
 			if err := c.writeCurrentLimit(c.evEntity, currentLimit); err != nil {
 				c.logger.Warn("Failed to re-apply limits after OSCEV update", zap.Error(err))
 			}
@@ -497,38 +549,46 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 	case opev.DataUpdateCurrentLimits:
 		// OPEV current limits updated - cache them for later use
+		c.logger.Debug("OPEV DataUpdateCurrentLimits event received", zap.Bool("has_entity", c.evEntity != nil))
 		if c.evEntity != nil {
 			minLimits, maxLimits, defaultLimits, err := c.opEV.CurrentLimits(c.evEntity)
 			if err == nil {
 				c.opEVMinLimits = minLimits
 				c.opEVMaxLimits = maxLimits
 				c.opEVDefaultLimits = defaultLimits
-				c.logger.Debug("OPEV current limits cached",
+				c.limitsReceived = true
+				c.logger.Info("OPEV current limits received from charger/vehicle",
 					zap.Int("phases", len(minLimits)),
-					zap.Any("min", minLimits),
-					zap.Any("max", maxLimits),
-					zap.Any("default", defaultLimits))
+					zap.Float64s("min", minLimits),
+					zap.Float64s("max", maxLimits),
+					zap.Float64s("default", defaultLimits))
 			} else {
-				c.logger.Debug("Failed to get OPEV current limits", zap.Error(err))
+				c.logger.Warn("Failed to get OPEV current limits", zap.Error(err))
 			}
+		} else {
+			c.logger.Warn("OPEV DataUpdateCurrentLimits received but no entity connected")
 		}
 	
 	case oscev.DataUpdateCurrentLimits:
 		// OSCEV current limits updated - cache them for later use
+		c.logger.Debug("OSCEV DataUpdateCurrentLimits event received", zap.Bool("has_entity", c.evEntity != nil))
 		if c.evEntity != nil {
 			minLimits, maxLimits, defaultLimits, err := c.oscEV.CurrentLimits(c.evEntity)
 			if err == nil {
 				c.oscEVMinLimits = minLimits
 				c.oscEVMaxLimits = maxLimits
 				c.oscEVDefaultLimits = defaultLimits
-				c.logger.Debug("OSCEV current limits cached",
+				c.limitsReceived = true
+				c.logger.Info("OSCEV current limits received from charger/vehicle",
 					zap.Int("phases", len(minLimits)),
-					zap.Any("min", minLimits),
-					zap.Any("max", maxLimits),
-					zap.Any("default", defaultLimits))
+					zap.Float64s("min", minLimits),
+					zap.Float64s("max", maxLimits),
+					zap.Float64s("default", defaultLimits))
 			} else {
-				c.logger.Debug("Failed to get OSCEV current limits", zap.Error(err))
+				c.logger.Warn("Failed to get OSCEV current limits", zap.Error(err))
 			}
+		} else {
+			c.logger.Warn("OSCEV DataUpdateCurrentLimits received but no entity connected")
 		}
 	
 	case opev.DataUpdateLimit, oscev.DataUpdateLimit:

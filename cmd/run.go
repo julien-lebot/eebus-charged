@@ -209,7 +209,6 @@ func runService(cmd *cobra.Command, args []string) error {
 	logger.Info("Starting EEBUS HEMS")
 	logger.Info("Configuration loaded",
 		zap.Int("chargers", len(cfg.Chargers)),
-		zap.Float64("min_current", cfg.Charging.MinCurrent),
 		zap.Float64("max_current", cfg.Charging.MaxCurrent),
 		zap.Bool("mqtt_enabled", cfg.MQTT.Enabled),
 		zap.Bool("datadog_enabled", cfg.Datadog.Enabled),

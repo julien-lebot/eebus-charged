@@ -54,10 +54,6 @@ certificates:
 
 # Charging parameters
 charging:
-  # Minimum charging current in Amperes
-  # Most EVs support 6A, some can go as low as 2.2A
-  min_current: 6.0
-  
   # Maximum charging current in Amperes
   # This should match your electrical installation capacity
   # Common values:

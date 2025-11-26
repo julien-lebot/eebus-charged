@@ -51,7 +51,6 @@ type ChargerConfig struct {
 
 // ChargingConfig contains charging parameters
 type ChargingConfig struct {
-	MinCurrent     float64 `mapstructure:"min_current"`
 	MaxCurrent     float64 `mapstructure:"max_current"`
 	DefaultCurrent float64 `mapstructure:"default_current"`
 	Phases         int     `mapstructure:"phases"`
@@ -107,7 +106,6 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("network.api_port", 8080)
 	v.SetDefault("certificates.cert_file", "./certs/cert.pem")
 	v.SetDefault("certificates.key_file", "./certs/key.pem")
-	v.SetDefault("charging.min_current", 6.0)
 	v.SetDefault("charging.max_current", 32.0)
 	v.SetDefault("charging.default_current", 16.0)
 	v.SetDefault("charging.phases", 3)
@@ -160,12 +158,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("network.api_port must be between 1 and 65535")
 	}
 
-	if c.Charging.MinCurrent < 0 {
-		return fmt.Errorf("charging.min_current must be positive")
-	}
-
-	if c.Charging.MaxCurrent < c.Charging.MinCurrent {
-		return fmt.Errorf("charging.max_current must be greater than min_current")
+	if c.Charging.MaxCurrent <= 0 {
+		return fmt.Errorf("charging.max_current must be positive")
 	}
 
 	if c.Charging.Phases != 1 && c.Charging.Phases != 3 {
