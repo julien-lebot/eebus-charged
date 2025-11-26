@@ -243,10 +243,19 @@ func (c *Charger) SetCurrentLimit(current float64) error {
 
 	c.mu.Lock()
 	c.currentLimit = current
+	chargingState := c.chargingState
 	c.mu.Unlock()
 
-	// If a vehicle is connected, update the limit immediately
-	// Write limit regardless of charging state - needed for pause/resume control
+	// If charging is explicitly stopped, cache the limit but don't apply it
+	// This prevents SetCurrentLimit from overriding an explicit stop
+	if chargingState == ChargingStateStopped {
+		c.logger.Info("Charging is stopped - caching limit but not applying",
+			zap.Float64("current", current))
+		c.publishState()
+		return nil
+	}
+
+	// If a vehicle is connected and charging is not stopped, update the limit immediately
 	if evEntity != nil {
 		if err := c.writeCurrentLimit(evEntity, current); err != nil {
 			return fmt.Errorf("failed to update current limit: %w", err)
