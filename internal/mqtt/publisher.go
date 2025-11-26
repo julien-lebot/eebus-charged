@@ -59,6 +59,11 @@ type ChargerState struct {
 	SessionEnergy         float64 `json:"session_energy_wh"`          // Total energy this session
 	ChargeRemainingEnergy *float64 `json:"charge_remaining_energy_wh,omitempty"` // Estimated remaining energy
 
+	// Features and capabilities
+	CommunicationStandard string            `json:"communication_standard,omitempty"`
+	ControllerType        string            `json:"controller_type,omitempty"`
+	Features              map[string]map[string]interface{} `json:"features,omitempty"` // Feature name -> properties (e.g., {"supported": true, "limits": {...}})
+
 	// Timestamp
 	Timestamp time.Time `json:"timestamp"`
 }
@@ -320,6 +325,68 @@ func (h *MqttHandler) PublishChargerState(chargerName string, state *ChargerStat
 	if state.ChargeRemainingEnergy != nil {
 		if err := h.publish(fmt.Sprintf("%s/charge_remaining_energy", baseTopic), *state.ChargeRemainingEnergy); err != nil {
 			return err
+		}
+	}
+
+	// Publish capabilities
+	if state.CommunicationStandard != "" {
+		if err := h.publish(fmt.Sprintf("%s/communication_standard", baseTopic), state.CommunicationStandard); err != nil {
+			return err
+		}
+	}
+	if state.ControllerType != "" {
+		if err := h.publish(fmt.Sprintf("%s/controller_type", baseTopic), state.ControllerType); err != nil {
+			return err
+		}
+	}
+	
+	// Publish features map
+	if len(state.Features) > 0 {
+		// Publish full features object
+		if err := h.publish(fmt.Sprintf("%s/features", baseTopic), state.Features); err != nil {
+			return err
+		}
+		
+		// Also publish individual features for easier access
+		for featureName, featureProps := range state.Features {
+			featureTopic := fmt.Sprintf("%s/features/%s", baseTopic, featureName)
+			
+			// Publish full feature properties
+			if err := h.publish(featureTopic, featureProps); err != nil {
+				return err
+			}
+			
+			// Publish individual properties for easier access
+			for propName, propValue := range featureProps {
+				if propName == "limits" {
+					// Publish limits object and individual arrays
+					if limits, ok := propValue.(map[string]interface{}); ok {
+						if err := h.publish(fmt.Sprintf("%s/limits", featureTopic), limits); err != nil {
+							return err
+						}
+						if min, ok := limits["min"].([]float64); ok {
+							if err := h.publish(fmt.Sprintf("%s/limits/min", featureTopic), min); err != nil {
+								return err
+							}
+						}
+						if max, ok := limits["max"].([]float64); ok {
+							if err := h.publish(fmt.Sprintf("%s/limits/max", featureTopic), max); err != nil {
+								return err
+							}
+						}
+						if def, ok := limits["default"].([]float64); ok {
+							if err := h.publish(fmt.Sprintf("%s/limits/default", featureTopic), def); err != nil {
+								return err
+							}
+						}
+					}
+				} else {
+					// Publish other properties directly
+					if err := h.publish(fmt.Sprintf("%s/%s", featureTopic, propName), propValue); err != nil {
+						return err
+					}
+				}
+			}
 		}
 	}
 

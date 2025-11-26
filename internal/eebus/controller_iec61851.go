@@ -31,6 +31,20 @@ func (c *iec61851Controller) Name() string {
 	return "iec61851"
 }
 
+func (c *iec61851Controller) GetCapabilities(evEntity spineapi.EntityRemoteInterface) ControllerCapabilities {
+	opevAvailable := false
+	if evEntity != nil {
+		opevAvailable = c.opEV.IsScenarioAvailableAtEntity(evEntity, 1)
+	}
+	
+	return ControllerCapabilities{
+		CommunicationStandard: "iec61851",
+		ControllerType:        "iec61851",
+		OPEVAvailable:         &opevAvailable,
+		// VAS and OSCEV not applicable for IEC 61851
+	}
+}
+
 func (c *iec61851Controller) WriteCurrentLimit(evEntity spineapi.EntityRemoteInterface, current float64) error {
 	span := tracer.StartSpan("iec61851.write_current_limit", tracer.Tag("current", current))
 	defer span.Finish()

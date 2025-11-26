@@ -45,15 +45,18 @@ type ErrorResponse struct {
 }
 
 type StatusResponse struct {
-	Name          string  `json:"name"`
-	SKI           string  `json:"ski"`
-	Connected     bool    `json:"connected"`
-	ChargingState string  `json:"charging_state"`
-	CurrentLimit  float64 `json:"current_limit"`
-	MinCurrent    float64 `json:"min_current"`
-	MaxCurrent    float64 `json:"max_current"`
-	VehicleID     string  `json:"vehicle_id,omitempty"`
-	VehicleName   string  `json:"vehicle_name,omitempty"`
+	Name                 string  `json:"name"`
+	SKI                  string  `json:"ski"`
+	Connected            bool    `json:"connected"`
+	ChargingState        string  `json:"charging_state"`
+	CurrentLimit         float64 `json:"current_limit"`
+	MinCurrent           float64 `json:"min_current"`
+	MaxCurrent           float64 `json:"max_current"`
+	VehicleID            string  `json:"vehicle_id,omitempty"`
+	VehicleName          string  `json:"vehicle_name,omitempty"`
+	CommunicationStandard string            `json:"communication_standard,omitempty"`
+	ControllerType       string            `json:"controller_type,omitempty"`
+	Features             map[string]map[string]interface{} `json:"features,omitempty"` // Feature name -> properties (e.g., {"supported": true, "limits": {...}})
 }
 
 type SetCurrentRequest struct {
@@ -201,7 +204,7 @@ func (s *Server) handleCharger(w http.ResponseWriter, r *http.Request) {
 func (s *Server) chargerToStatus(charger *eebus.Charger) StatusResponse {
 	status := charger.GetStatus()
 	
-	return StatusResponse{
+	resp := StatusResponse{
 		Name:          status["name"].(string),
 		SKI:           status["ski"].(string),
 		Connected:     status["connected"].(bool),
@@ -212,6 +215,21 @@ func (s *Server) chargerToStatus(charger *eebus.Charger) StatusResponse {
 		VehicleID:     getStringOrEmpty(status, "vehicle_id"),
 		VehicleName:   getStringOrEmpty(status, "vehicle_name"),
 	}
+	
+	// Add capabilities if available
+	if commStd, ok := status["communication_standard"].(string); ok {
+		resp.CommunicationStandard = commStd
+	}
+	if ctrlType, ok := status["controller_type"].(string); ok {
+		resp.ControllerType = ctrlType
+	}
+	
+	// Extract features from status (built in charger.go)
+	if features, ok := status["features"].(map[string]map[string]interface{}); ok {
+		resp.Features = features
+	}
+	
+	return resp
 }
 
 // Helper functions

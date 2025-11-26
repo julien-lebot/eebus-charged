@@ -9,6 +9,8 @@ import (
 	"github.com/enbility/eebus-go/usecases/cem/evcc"
 	"github.com/enbility/eebus-go/usecases/cem/evcem"
 	"github.com/enbility/eebus-go/usecases/cem/evsoc"
+	"github.com/enbility/eebus-go/usecases/cem/opev"
+	"github.com/enbility/eebus-go/usecases/cem/oscev"
 	spineapi "github.com/enbility/spine-go/api"
 	"github.com/julienar/eebus-charged/internal/config"
 	"github.com/julienar/eebus-charged/internal/mqtt"
@@ -58,6 +60,15 @@ type Charger struct {
 	currentPerPhase       []float64                  // Current per phase in A (L1, L2, L3)
 	powerPerPhase         []float64                  // Power per phase in W (L1, L2, L3)
 	vehicleSoC            *float64                   // Vehicle State of Charge (%)
+	asymmetricChargingSupported *bool                // Vehicle supports asymmetric charging (different power per phase)
+	
+	// Cached current limits (min, max, default per phase) from charger/vehicle
+	opEVMinLimits         []float64                  // OPEV min limits per phase
+	opEVMaxLimits         []float64                  // OPEV max limits per phase
+	opEVDefaultLimits     []float64                  // OPEV default limits per phase
+	oscEVMinLimits        []float64                  // OSCEV min limits per phase
+	oscEVMaxLimits        []float64                  // OSCEV max limits per phase
+	oscEVDefaultLimits    []float64                  // OSCEV default limits per phase
 }
 
 // NewCharger creates a new charger instance
@@ -254,7 +265,8 @@ func (c *Charger) SetCurrentLimit(current float64) error {
 	c.mu.Unlock()
 
 	// If a vehicle is connected, update the limit immediately
-	if evEntity != nil && c.chargingState == ChargingStateActive {
+	// Write limit regardless of charging state - needed for pause/resume control
+	if evEntity != nil {
 		if err := c.writeCurrentLimit(evEntity, current); err != nil {
 			return fmt.Errorf("failed to update current limit: %w", err)
 		}
@@ -282,6 +294,83 @@ func (c *Charger) GetStatus() map[string]interface{} {
 
 	if c.isConnected {
 		status["vehicle_id"] = c.vehicleID
+	}
+
+	// Build unified features map
+	features := make(map[string]map[string]interface{})
+	
+	// Add capabilities if controller is available
+	if c.controller != nil && c.evEntity != nil {
+		capabilities := c.controller.GetCapabilities(c.evEntity)
+		status["communication_standard"] = capabilities.CommunicationStandard
+		status["controller_type"] = capabilities.ControllerType
+		
+		// VAS feature
+		if capabilities.VASSupported != nil {
+			features["vas"] = map[string]interface{}{
+				"supported": *capabilities.VASSupported,
+			}
+		}
+		
+		// OSCEV feature
+		if capabilities.OSCEVAvailable != nil {
+			oscevFeature := map[string]interface{}{
+				"supported": *capabilities.OSCEVAvailable,
+			}
+			// Add limits if available
+			if len(c.oscEVMinLimits) > 0 || len(c.oscEVMaxLimits) > 0 {
+				limits := map[string]interface{}{}
+				if len(c.oscEVMinLimits) > 0 {
+					limits["min"] = c.oscEVMinLimits
+				}
+				if len(c.oscEVMaxLimits) > 0 {
+					limits["max"] = c.oscEVMaxLimits
+				}
+				if len(c.oscEVDefaultLimits) > 0 {
+					limits["default"] = c.oscEVDefaultLimits
+				}
+				oscevFeature["limits"] = limits
+			}
+			features["oscev"] = oscevFeature
+		}
+		
+		// OPEV feature
+		if capabilities.OPEVAvailable != nil {
+			opevFeature := map[string]interface{}{
+				"supported": *capabilities.OPEVAvailable,
+			}
+			// Add limits if available
+			if len(c.opEVMinLimits) > 0 || len(c.opEVMaxLimits) > 0 {
+				limits := map[string]interface{}{}
+				if len(c.opEVMinLimits) > 0 {
+					limits["min"] = c.opEVMinLimits
+				}
+				if len(c.opEVMaxLimits) > 0 {
+					limits["max"] = c.opEVMaxLimits
+				}
+				if len(c.opEVDefaultLimits) > 0 {
+					limits["default"] = c.opEVDefaultLimits
+				}
+				opevFeature["limits"] = limits
+			}
+			features["opev"] = opevFeature
+		}
+		
+		// Asymmetric charging feature
+		if c.asymmetricChargingSupported != nil {
+			features["asymmetric_charging"] = map[string]interface{}{
+				"supported": *c.asymmetricChargingSupported,
+			}
+		}
+	} else if c.communicationStandard != "" {
+		// Protocol known but controller not yet created
+		status["communication_standard"] = c.communicationStandard
+		status["controller_type"] = "pending"
+	}
+	
+	// Add features to status if any exist
+	if len(features) > 0 {
+		status["features"] = features
 	}
 
 	return status
@@ -333,8 +422,10 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 
 	switch event {
 	case evcc.EvConnected:
-		// Vehicle connected - just set the flag, data will come via other events
+		// Vehicle connected - set the flag and get initial charge state
 		c.logger.Info("Vehicle connected")
+		// Try to get initial charge state
+		c.updateChargeState()
 		c.isConnected = true
 
 	case evcc.EvDisconnected:
@@ -368,6 +459,10 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		// Charging state changed (active, paused, finished)
 		c.updateChargeState()
 
+	case evcc.DataUpdateAsymmetricChargingSupport:
+		// Vehicle asymmetric charging support updated
+		c.updateAsymmetricChargingSupport()
+
 	case evcem.DataUpdateCurrentPerPhase:
 		// Current measurements updated
 		c.updateCurrentPerPhase()
@@ -384,9 +479,63 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		// Vehicle SoC updated (ISO 15118-20 or ISO 15118-2 with VAS)
 		c.updateStateOfCharge()
 
-	case evcc.UseCaseSupportUpdate, evcem.UseCaseSupportUpdate, evsoc.UseCaseSupportUpdate:
+	case evcc.UseCaseSupportUpdate, evcem.UseCaseSupportUpdate, evsoc.UseCaseSupportUpdate, opev.UseCaseSupportUpdate, oscev.UseCaseSupportUpdate:
 		// Use case support changed - log for debugging
 		c.logger.Debug("Use case support updated", zap.String("event", string(event)))
+		
+		// If OSCEV use case support updated, re-apply current limit
+		// This allows the controller to re-check VAS support and switch modes if it becomes available
+		if event == oscev.UseCaseSupportUpdate && c.controller != nil && c.evEntity != nil {
+			c.logger.Info("OSCEV use case support updated - re-applying current limit to check for VAS support")
+			c.mu.RLock()
+			currentLimit := c.currentLimit
+			c.mu.RUnlock()
+			if err := c.writeCurrentLimit(c.evEntity, currentLimit); err != nil {
+				c.logger.Warn("Failed to re-apply limits after OSCEV update", zap.Error(err))
+			}
+		}
+
+	case opev.DataUpdateCurrentLimits:
+		// OPEV current limits updated - cache them for later use
+		if c.evEntity != nil {
+			minLimits, maxLimits, defaultLimits, err := c.opEV.CurrentLimits(c.evEntity)
+			if err == nil {
+				c.opEVMinLimits = minLimits
+				c.opEVMaxLimits = maxLimits
+				c.opEVDefaultLimits = defaultLimits
+				c.logger.Debug("OPEV current limits cached",
+					zap.Int("phases", len(minLimits)),
+					zap.Any("min", minLimits),
+					zap.Any("max", maxLimits),
+					zap.Any("default", defaultLimits))
+			} else {
+				c.logger.Debug("Failed to get OPEV current limits", zap.Error(err))
+			}
+		}
+	
+	case oscev.DataUpdateCurrentLimits:
+		// OSCEV current limits updated - cache them for later use
+		if c.evEntity != nil {
+			minLimits, maxLimits, defaultLimits, err := c.oscEV.CurrentLimits(c.evEntity)
+			if err == nil {
+				c.oscEVMinLimits = minLimits
+				c.oscEVMaxLimits = maxLimits
+				c.oscEVDefaultLimits = defaultLimits
+				c.logger.Debug("OSCEV current limits cached",
+					zap.Int("phases", len(minLimits)),
+					zap.Any("min", minLimits),
+					zap.Any("max", maxLimits),
+					zap.Any("default", defaultLimits))
+			} else {
+				c.logger.Debug("Failed to get OSCEV current limits", zap.Error(err))
+			}
+		}
+	
+	case opev.DataUpdateLimit, oscev.DataUpdateLimit:
+		// Limit updates from OPEV/OSCEV - these are informational notifications
+		// that limits have been updated (we're the ones writing them, so these are confirmations)
+		// Log at debug level to avoid noise, but handle explicitly to avoid "unhandled" warnings
+		c.logger.Debug("Limit update notification received", zap.String("event", string(event)))
 
 	default:
 		// Unknown event - log for debugging
@@ -527,26 +676,61 @@ func (c *Charger) updateManufacturerData() {
 // updateChargeState updates the charging state when the EV reports state changes
 func (c *Charger) updateChargeState() {
 	if c.evEntity == nil {
+		c.logger.Debug("Cannot update charge state: no vehicle connected")
 		return
 	}
 
 	chargeState, err := c.evCC.ChargeState(c.evEntity)
 	if err != nil {
+		c.logger.Debug("Failed to get charge state from EVCC, using power measurements as fallback", zap.Error(err))
+		// Fallback: infer state from power measurements
+		if c.isActuallyCharging() {
+			c.chargingState = ChargingStateActive
+			c.logger.Debug("Charging state inferred as active from power measurements")
+		} else {
+			// Only set to stopped if we have power data; otherwise keep current state
+			if len(c.currentPerPhase) > 0 || len(c.powerPerPhase) > 0 {
+				c.chargingState = ChargingStateStopped
+				c.logger.Debug("Charging state inferred as stopped from power measurements")
+			}
+			// If no power data available, keep current state (might be unknown initially)
+		}
 		return
 	}
+
+	c.logger.Debug("Charge state received from EVCC", zap.String("state", string(chargeState)))
 
 	switch chargeState {
 	case ucapi.EVChargeStateTypeActive:
 		// Check if actually charging by looking at power
 		if c.isActuallyCharging() {
 			c.chargingState = ChargingStateActive
+			c.logger.Debug("Charging state set to active (power detected)")
 		} else {
 			c.chargingState = ChargingStateStopped
+			c.logger.Debug("Charging state set to stopped (no power detected)")
 		}
 	case ucapi.EVChargeStateTypePaused, ucapi.EVChargeStateTypeFinished:
 		c.chargingState = ChargingStateStopped
+		c.logger.Debug("Charging state set to stopped", zap.String("evcc_state", string(chargeState)))
+	case ucapi.EVChargeStateTypeUnplugged:
+		c.chargingState = ChargingStateStopped
+		c.logger.Debug("Charging state set to stopped (unplugged)")
+	case ucapi.EVChargeStateTypeError:
+		c.chargingState = ChargingStateStopped
+		c.logger.Warn("Charging state set to stopped (error state from vehicle)")
+	case ucapi.EVChargeStateTypeUnknown:
+		// Fallback to power measurements if EVCC returns unknown
+		if c.isActuallyCharging() {
+			c.chargingState = ChargingStateActive
+			c.logger.Debug("Charging state inferred as active from power (EVCC returned unknown)")
+		} else {
+			c.chargingState = ChargingStateStopped
+			c.logger.Debug("Charging state set to stopped (EVCC returned unknown, no power)")
+		}
 	default:
 		c.chargingState = ChargingStateUnknown
+		c.logger.Warn("Unknown charge state from EVCC", zap.String("state", string(chargeState)))
 	}
 }
 
@@ -600,6 +784,20 @@ func (c *Charger) updateStateOfCharge() {
 			c.vehicleSoC = &soc
 			c.logger.Info("Vehicle SoC updated", zap.Float64("soc", soc))
 		}
+	}
+}
+
+// updateAsymmetricChargingSupport updates the cached asymmetric charging support status
+func (c *Charger) updateAsymmetricChargingSupport() {
+	if c.evEntity == nil {
+		return
+	}
+
+	if supported, err := c.evCC.AsymmetricChargingSupport(c.evEntity); err == nil {
+		c.asymmetricChargingSupported = &supported
+		c.logger.Info("Vehicle asymmetric charging support updated", zap.Bool("supported", supported))
+	} else {
+		c.logger.Debug("Failed to get asymmetric charging support", zap.Error(err))
 	}
 }
 
@@ -664,6 +862,78 @@ func (c *Charger) publishState() {
 		SessionEnergy:     c.sessionEnergy, // Cached from DataUpdateEnergyCharged events
 		VehicleSoC:        c.vehicleSoC, // Cached from DataUpdateStateOfCharge events
 		ChargeRemainingEnergy: nil, // Not available from ISO 15118
+	}
+	
+	// Add capabilities if controller is available
+	if c.controller != nil && c.evEntity != nil {
+		capabilities := c.controller.GetCapabilities(c.evEntity)
+		state.CommunicationStandard = capabilities.CommunicationStandard
+		state.ControllerType = capabilities.ControllerType
+		
+		// Build unified features map
+		state.Features = make(map[string]map[string]interface{})
+		
+		// VAS feature
+		if capabilities.VASSupported != nil {
+			state.Features["vas"] = map[string]interface{}{
+				"supported": *capabilities.VASSupported,
+			}
+		}
+		
+		// OSCEV feature
+		if capabilities.OSCEVAvailable != nil {
+			oscevFeature := map[string]interface{}{
+				"supported": *capabilities.OSCEVAvailable,
+			}
+			// Add limits if available
+			if len(c.oscEVMinLimits) > 0 || len(c.oscEVMaxLimits) > 0 {
+				limits := map[string]interface{}{}
+				if len(c.oscEVMinLimits) > 0 {
+					limits["min"] = c.oscEVMinLimits
+				}
+				if len(c.oscEVMaxLimits) > 0 {
+					limits["max"] = c.oscEVMaxLimits
+				}
+				if len(c.oscEVDefaultLimits) > 0 {
+					limits["default"] = c.oscEVDefaultLimits
+				}
+				oscevFeature["limits"] = limits
+			}
+			state.Features["oscev"] = oscevFeature
+		}
+		
+		// OPEV feature
+		if capabilities.OPEVAvailable != nil {
+			opevFeature := map[string]interface{}{
+				"supported": *capabilities.OPEVAvailable,
+			}
+			// Add limits if available
+			if len(c.opEVMinLimits) > 0 || len(c.opEVMaxLimits) > 0 {
+				limits := map[string]interface{}{}
+				if len(c.opEVMinLimits) > 0 {
+					limits["min"] = c.opEVMinLimits
+				}
+				if len(c.opEVMaxLimits) > 0 {
+					limits["max"] = c.opEVMaxLimits
+				}
+				if len(c.opEVDefaultLimits) > 0 {
+					limits["default"] = c.opEVDefaultLimits
+				}
+				opevFeature["limits"] = limits
+			}
+			state.Features["opev"] = opevFeature
+		}
+		
+		// Asymmetric charging feature
+		if c.asymmetricChargingSupported != nil {
+			state.Features["asymmetric_charging"] = map[string]interface{}{
+				"supported": *c.asymmetricChargingSupported,
+			}
+		}
+	} else if c.communicationStandard != "" {
+		// Protocol known but controller not yet created
+		state.CommunicationStandard = c.communicationStandard
+		state.ControllerType = "pending"
 	}
 
 	if err := c.mqttHandler.PublishChargerState(c.config.Name, state); err != nil {

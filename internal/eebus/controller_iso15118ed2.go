@@ -41,18 +41,38 @@ func (c *iso15118ed2Controller) Name() string {
 	return "iso15118-2ed2"
 }
 
+func (c *iso15118ed2Controller) GetCapabilities(evEntity spineapi.EntityRemoteInterface) ControllerCapabilities {
+	vasSupported := false
+	oscevAvailable := false
+	opevAvailable := false
+	
+	if evEntity != nil {
+		vasSupported = c.supportsVAS(evEntity)
+		oscevAvailable = c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1)
+		opevAvailable = c.opEV.IsScenarioAvailableAtEntity(evEntity, 1)
+	}
+	
+	return ControllerCapabilities{
+		CommunicationStandard: "iso15118-2ed2",
+		ControllerType:        "iso15118-2ed2",
+		VASSupported:          &vasSupported,
+		OSCEVAvailable:        &oscevAvailable,
+		OPEVAvailable:         &opevAvailable,
+	}
+}
+
 func (c *iso15118ed2Controller) WriteCurrentLimit(evEntity spineapi.EntityRemoteInterface, current float64) error {
 	span := tracer.StartSpan("iso15118ed2.write_current_limit", tracer.Tag("current", current))
 	defer span.Finish()
 
 	// Try VAS/OSCEV mode first (VW/Porsche vehicles)
 	if c.supportsVAS(evEntity) {
-		c.logger.Debug("Using VAS/OSCEV mode for charging control")
+		c.logger.Debug("Using VAS/OSCEV mode for charging control", zap.Float64("current", current))
 		return c.writeVASLimits(evEntity, current)
 	}
 
 	// Fallback to standard OPEV obligations
-	c.logger.Debug("VAS not supported, using standard OPEV obligations")
+	c.logger.Debug("VAS not supported, using standard OPEV obligations", zap.Float64("current", current))
 	return c.writeOPEVLimits(evEntity, current)
 }
 
@@ -60,31 +80,84 @@ func (c *iso15118ed2Controller) WriteCurrentLimit(evEntity spineapi.EntityRemote
 func (c *iso15118ed2Controller) supportsVAS(evEntity spineapi.EntityRemoteInterface) bool {
 	// Must use ISO 15118-2 (already validated by controller selection)
 	
-	// Check if OSCEV (optimization of self consumption) is available
-	if !c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1) {
-		return false
-	}
-
-	// Check if vehicle announces OSCEV support
-	for _, uci := range evEntity.Device().UseCases() {
+	// First check if vehicle announces OSCEV support in use cases list
+	// This is the primary indicator - the vehicle announces what it supports
+	useCases := evEntity.Device().UseCases()
+	c.logger.Debug("VAS detection: Checking use cases",
+		zap.Int("use_case_count", len(useCases)))
+	
+	oscevAnnounced := false
+	for i, uci := range useCases {
 		// Check entity address matches
+		entityMatch := true
 		if uci.Address != nil &&
 			evEntity.Address() != nil &&
 			slices.Compare(uci.Address.Entity, evEntity.Address().Entity) != 0 {
+			entityMatch = false
+			c.logger.Debug("VAS detection: Skipping use case for different entity address",
+				zap.Int("index", i))
 			continue
 		}
 
-		for _, uc := range uci.UseCaseSupport {
-			if uc.UseCaseName != nil &&
-				*uc.UseCaseName == model.UseCaseNameTypeOptimizationOfSelfConsumptionDuringEVCharging &&
-				uc.UseCaseAvailable != nil &&
-				*uc.UseCaseAvailable {
-				return true
+		c.logger.Debug("VAS detection: Checking use case info",
+			zap.Int("index", i),
+			zap.Bool("entity_match", entityMatch),
+			zap.Int("support_count", len(uci.UseCaseSupport)))
+
+		for j, uc := range uci.UseCaseSupport {
+			useCaseName := ""
+			if uc.UseCaseName != nil {
+				useCaseName = string(*uc.UseCaseName)
 			}
+			available := uc.UseCaseAvailable != nil && *uc.UseCaseAvailable
+			
+			c.logger.Debug("VAS detection: Use case",
+				zap.Int("uc_index", j),
+				zap.String("name", useCaseName),
+				zap.Bool("available", available))
+			
+			if uc.UseCaseName != nil &&
+				*uc.UseCaseName == model.UseCaseNameTypeOptimizationOfSelfConsumptionDuringEVCharging {
+				c.logger.Info("VAS detection: OSCEV use case found in vehicle announcements",
+					zap.Bool("available", available),
+					zap.Bool("has_availability_flag", uc.UseCaseAvailable != nil))
+				
+				if available {
+					oscevAnnounced = true
+					c.logger.Debug("VAS detection: OSCEV use case found and available in use cases list")
+				} else {
+					c.logger.Warn("VAS detection: OSCEV use case found but marked as unavailable - vehicle may require certain conditions (e.g., charging active, SoC available, etc.)")
+					// Note: Some vehicles announce OSCEV but mark it as unavailable until certain conditions are met
+					// We'll still check scenario availability below, but won't use OSCEV if UseCaseAvailable is false
+				}
+				break
+			}
+		}
+		if oscevAnnounced {
+			break
 		}
 	}
 
-	return false
+	if !oscevAnnounced {
+		c.logger.Info("VAS not detected: OSCEV use case not announced by vehicle - falling back to OPEV obligations")
+		return false
+	}
+
+	// Secondary check: verify OSCEV scenario is available
+	// This may not be available immediately after protocol upgrade, but if the vehicle
+	// announces OSCEV support, we should try to use it anyway
+	oscEVAvailable := c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1)
+	c.logger.Debug("VAS detection: OSCEV scenario check",
+		zap.Bool("oscEV_scenario_available", oscEVAvailable))
+	
+	if !oscEVAvailable {
+		c.logger.Warn("VAS detection: OSCEV announced by vehicle but scenario not yet available - will try anyway (scenario may bind later)")
+		// Don't return false - if vehicle announces it, we should try to use it
+		// The scenario binding may happen later
+	}
+
+	c.logger.Info("VAS detected: OSCEV use case announced by vehicle - using recommendation mode")
+	return true
 }
 
 // writeVASLimits writes limits using VAS/OSCEV (recommendations)

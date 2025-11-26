@@ -14,6 +14,15 @@ var (
 	ErrOverloadProtectionUnavailable = errors.New("overload protection not available")
 )
 
+// ControllerCapabilities represents the capabilities of a charging controller
+type ControllerCapabilities struct {
+	CommunicationStandard string `json:"communication_standard"`
+	ControllerType        string `json:"controller_type"`
+	VASSupported          *bool  `json:"vas_supported,omitempty"` // nil if not applicable
+	OSCEVAvailable        *bool  `json:"oscev_available,omitempty"` // nil if not applicable
+	OPEVAvailable         *bool  `json:"opev_available,omitempty"`  // nil if not applicable
+}
+
 // ChargingController handles charging control for a specific communication standard
 type ChargingController interface {
 	// WriteCurrentLimit writes a current limit to the EV
@@ -22,6 +31,9 @@ type ChargingController interface {
 	
 	// Name returns the controller name for logging
 	Name() string
+	
+	// GetCapabilities returns the capabilities of this controller
+	GetCapabilities(evEntity spineapi.EntityRemoteInterface) ControllerCapabilities
 }
 
 // createController creates the appropriate controller for the communication standard
