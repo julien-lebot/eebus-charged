@@ -14,6 +14,14 @@ var (
 	ErrOverloadProtectionUnavailable = errors.New("overload protection not available")
 )
 
+// LimitsProvider provides cached current limits to avoid deadlock from calling CurrentLimits()
+type LimitsProvider interface {
+	// GetOPEVLimits returns cached OPEV min/max limits per phase
+	GetOPEVLimits() (minLimits, maxLimits []float64)
+	// GetOSCEVLimits returns cached OSCEV min/max limits per phase
+	GetOSCEVLimits() (minLimits, maxLimits []float64)
+}
+
 // ControllerCapabilities represents the capabilities of a charging controller
 type ControllerCapabilities struct {
 	CommunicationStandard string `json:"communication_standard"`
@@ -43,20 +51,21 @@ func createController(
 	evCC ucapi.CemEVCCInterface,
 	opEV ucapi.CemOPEVInterface,
 	oscEV ucapi.CemOSCEVInterface,
+	limitsProvider LimitsProvider,
 	logger *zap.Logger,
 ) ChargingController {
 	
 	switch commStd {
 	case "iec61851":
-		return newIec61851Controller(chargingCfg, opEV, logger)
+		return newIec61851Controller(chargingCfg, opEV, limitsProvider, logger)
 		
 	case "iso15118-2ed2":
 		// Check if VAS is supported
-		return newIso15118ed2Controller(chargingCfg, evCC, opEV, oscEV, logger)
+		return newIso15118ed2Controller(chargingCfg, evCC, opEV, oscEV, limitsProvider, logger)
 		
 	default:
 		logger.Debug("Unknown communication standard, using fallback", zap.String("standard", commStd))
-		return newIec61851Controller(chargingCfg, opEV, logger)
+		return newIec61851Controller(chargingCfg, opEV, limitsProvider, logger)
 	}
 }
 

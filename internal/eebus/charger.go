@@ -329,6 +329,20 @@ func (c *Charger) getEffectiveLimits() (minCurrent, maxCurrent float64) {
 	return minCurrent, maxCurrent
 }
 
+// GetOPEVLimits implements LimitsProvider interface
+// Must be called without holding c.mu lock to avoid deadlock
+// (may be called from event handler which already holds the lock)
+func (c *Charger) GetOPEVLimits() (minLimits, maxLimits []float64) {
+	return c.opEVMinLimits, c.opEVMaxLimits
+}
+
+// GetOSCEVLimits implements LimitsProvider interface
+// Must be called without holding c.mu lock to avoid deadlock
+// (may be called from event handler which already holds the lock)
+func (c *Charger) GetOSCEVLimits() (minLimits, maxLimits []float64) {
+	return c.oscEVMinLimits, c.oscEVMaxLimits
+}
+
 // GetStatus returns detailed status information
 func (c *Charger) GetStatus() map[string]interface{} {
 	c.mu.RLock()
@@ -446,11 +460,23 @@ func (c *Charger) writeCurrentLimit(evEntity spineapi.EntityRemoteInterface, cur
 		tracer.Tag("current", current))
 	defer span.Finish()
 
+	// Check if vehicle is still connected before attempting to write
+	c.mu.RLock()
+	isConnected := c.isConnected
+	c.mu.RUnlock()
+	
+	if !isConnected || evEntity == nil {
+		span.SetTag("skipped", "vehicle not connected")
+		c.logger.Debug("Skipping limit write - vehicle not connected")
+		return fmt.Errorf("vehicle not connected")
+	}
+
 	// Controller is created when communication standard is received
 	// If controller doesn't exist yet, protocol is still negotiating
 	if c.controller == nil {
 		span.SetTag("deferred", true)
-		c.logger.Info("Protocol negotiation in progress, deferring limit write",
+		// Only log at debug level to avoid spam - this is normal during initial connection
+		c.logger.Debug("Protocol negotiation in progress, deferring limit write",
 			zap.Float64("current", current),
 			zap.String("standard", c.communicationStandard))
 		return fmt.Errorf("protocol negotiation in progress - controller will be created when standard is known")
@@ -554,7 +580,6 @@ func (c *Charger) handleUseCaseEvent(device spineapi.DeviceRemoteInterface, enti
 		// This allows the controller to re-check VAS support and switch modes if it becomes available
 		if event == oscev.UseCaseSupportUpdate && c.controller != nil && c.evEntity != nil {
 			c.logger.Info("OSCEV use case support updated - re-applying current limit to check for VAS support")
-			// No lock needed - we already hold c.mu.Lock() from line 473
 			currentLimit := c.currentLimit
 			if err := c.writeCurrentLimit(c.evEntity, currentLimit); err != nil {
 				c.logger.Warn("Failed to re-apply limits after OSCEV update", zap.Error(err))
@@ -658,14 +683,15 @@ func (c *Charger) updateCommunicationStandard() {
 		// Create controller when communication standard is known
 		// Don't wait for charge state - protocol is ready when standard is received
 		if c.controller == nil && c.evEntity != nil {
-			c.controller = createController(
-				c.communicationStandard,
-				c.chargingCfg,
-				c.evCC,
-				c.opEV,
-				c.oscEV,
-				c.logger,
-			)
+		c.controller = createController(
+			c.communicationStandard,
+			c.chargingCfg,
+			c.evCC,
+			c.opEV,
+			c.oscEV,
+			c,
+			c.logger,
+		)
 			c.logger.Info("Controller created for communication standard",
 				zap.String("standard", c.communicationStandard),
 				zap.String("controller", c.controller.Name()))
@@ -682,14 +708,15 @@ func (c *Charger) updateCommunicationStandard() {
 			// Recreate controller for upgraded protocol
 			// This handles the transition from IEC61851 to ISO15118-2
 			if c.controller != nil {
-				c.controller = createController(
-					c.communicationStandard,
-					c.chargingCfg,
-					c.evCC,
-					c.opEV,
-					c.oscEV,
-					c.logger,
-				)
+		c.controller = createController(
+			c.communicationStandard,
+			c.chargingCfg,
+			c.evCC,
+			c.opEV,
+			c.oscEV,
+			c,
+			c.logger,
+		)
 				c.logger.Info("Controller recreated for upgraded protocol",
 					zap.String("controller", c.controller.Name()))
 				
@@ -697,7 +724,6 @@ func (c *Charger) updateCommunicationStandard() {
 				if c.evEntity != nil {
 					c.logger.Info("Re-applying limits with upgraded controller",
 						zap.Float64("current", c.currentLimit))
-					
 					if err := c.writeCurrentLimit(c.evEntity, c.currentLimit); err != nil {
 						c.logger.Warn("Failed to re-apply limits after protocol upgrade", zap.Error(err))
 					}

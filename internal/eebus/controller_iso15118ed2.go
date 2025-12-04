@@ -14,11 +14,12 @@ import (
 // iso15118ed2Controller handles charging via ISO 15118-2 Edition 2
 // Supports VW VAS mode using OSCEV (recommendations) instead of OPEV (obligations)
 type iso15118ed2Controller struct {
-	chargingCfg *config.ChargingConfig
-	evCC        ucapi.CemEVCCInterface
-	opEV        ucapi.CemOPEVInterface
-	oscEV       ucapi.CemOSCEVInterface
-	logger      *zap.Logger
+	chargingCfg    *config.ChargingConfig
+	evCC           ucapi.CemEVCCInterface
+	opEV           ucapi.CemOPEVInterface
+	oscEV          ucapi.CemOSCEVInterface
+	limitsProvider LimitsProvider
+	logger         *zap.Logger
 }
 
 func newIso15118ed2Controller(
@@ -26,14 +27,16 @@ func newIso15118ed2Controller(
 	evCC ucapi.CemEVCCInterface,
 	opEV ucapi.CemOPEVInterface,
 	oscEV ucapi.CemOSCEVInterface,
+	limitsProvider LimitsProvider,
 	logger *zap.Logger,
 ) *iso15118ed2Controller {
 	return &iso15118ed2Controller{
-		chargingCfg: chargingCfg,
-		evCC:        evCC,
-		opEV:        opEV,
-		oscEV:       oscEV,
-		logger:      logger.With(zap.String("controller", "iso15118-2ed2")),
+		chargingCfg:    chargingCfg,
+		evCC:           evCC,
+		opEV:           opEV,
+		oscEV:          oscEV,
+		limitsProvider: limitsProvider,
+		logger:         logger.With(zap.String("controller", "iso15118-2ed2")),
 	}
 }
 
@@ -45,13 +48,13 @@ func (c *iso15118ed2Controller) GetCapabilities(evEntity spineapi.EntityRemoteIn
 	vasSupported := false
 	oscevAvailable := false
 	opevAvailable := false
-	
+
 	if evEntity != nil {
 		vasSupported = c.supportsVAS(evEntity)
 		oscevAvailable = c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1)
 		opevAvailable = c.opEV.IsScenarioAvailableAtEntity(evEntity, 1)
 	}
-	
+
 	return ControllerCapabilities{
 		CommunicationStandard: "iso15118-2ed2",
 		ControllerType:        "iso15118-2ed2",
@@ -65,71 +68,50 @@ func (c *iso15118ed2Controller) WriteCurrentLimit(evEntity spineapi.EntityRemote
 	span := tracer.StartSpan("iso15118ed2.write_current_limit", tracer.Tag("current", current))
 	defer span.Finish()
 
-	// Try VAS/OSCEV mode first (VW/Porsche vehicles)
+	// Hierarchy: Try VAS/OSCEV first, then OSCEV standalone, then OPEV as last resort
+
+	// 1. Try VAS/OSCEV mode (VW/Porsche vehicles with full VAS support)
 	if c.supportsVAS(evEntity) {
 		c.logger.Debug("Using VAS/OSCEV mode for charging control", zap.Float64("current", current))
-		return c.writeVASLimits(evEntity, current)
+		return c.writeOSCEVLimits(evEntity, current)
 	}
 
-	// Fallback to standard OPEV obligations
-	c.logger.Debug("VAS not supported, using standard OPEV obligations", zap.Float64("current", current))
+	// 2. Try OSCEV standalone (even without VAS, if available)
+	if c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1) {
+		c.logger.Debug("VAS not supported, trying OSCEV standalone", zap.Float64("current", current))
+		return c.writeOSCEVLimits(evEntity, current)
+	}
+
+	// 3. Fallback to standard OPEV obligations
+	c.logger.Debug("OSCEV not available, using standard OPEV obligations", zap.Float64("current", current))
 	return c.writeOPEVLimits(evEntity, current)
 }
 
 // supportsVAS checks if the vehicle supports VW VAS (PV mode)
+// Caches result to avoid repeated checks and excessive logging
 func (c *iso15118ed2Controller) supportsVAS(evEntity spineapi.EntityRemoteInterface) bool {
 	// Must use ISO 15118-2 (already validated by controller selection)
-	
+
 	// First check if vehicle announces OSCEV support in use cases list
 	// This is the primary indicator - the vehicle announces what it supports
 	useCases := evEntity.Device().UseCases()
-	c.logger.Debug("VAS detection: Checking use cases",
-		zap.Int("use_case_count", len(useCases)))
-	
+
 	oscevAnnounced := false
-	for i, uci := range useCases {
+	oscevAvailable := false
+	for _, uci := range useCases {
 		// Check entity address matches
-		entityMatch := true
 		if uci.Address != nil &&
 			evEntity.Address() != nil &&
 			slices.Compare(uci.Address.Entity, evEntity.Address().Entity) != 0 {
-			entityMatch = false
-			c.logger.Debug("VAS detection: Skipping use case for different entity address",
-				zap.Int("index", i))
 			continue
 		}
 
-		c.logger.Debug("VAS detection: Checking use case info",
-			zap.Int("index", i),
-			zap.Bool("entity_match", entityMatch),
-			zap.Int("support_count", len(uci.UseCaseSupport)))
-
-		for j, uc := range uci.UseCaseSupport {
-			useCaseName := ""
-			if uc.UseCaseName != nil {
-				useCaseName = string(*uc.UseCaseName)
-			}
-			available := uc.UseCaseAvailable != nil && *uc.UseCaseAvailable
-			
-			c.logger.Debug("VAS detection: Use case",
-				zap.Int("uc_index", j),
-				zap.String("name", useCaseName),
-				zap.Bool("available", available))
-			
+		for _, uc := range uci.UseCaseSupport {
 			if uc.UseCaseName != nil &&
 				*uc.UseCaseName == model.UseCaseNameTypeOptimizationOfSelfConsumptionDuringEVCharging {
-				c.logger.Info("VAS detection: OSCEV use case found in vehicle announcements",
-					zap.Bool("available", available),
-					zap.Bool("has_availability_flag", uc.UseCaseAvailable != nil))
-				
-				if available {
-					oscevAnnounced = true
-					c.logger.Debug("VAS detection: OSCEV use case found and available in use cases list")
-				} else {
-					c.logger.Warn("VAS detection: OSCEV use case found but marked as unavailable - vehicle may require certain conditions (e.g., charging active, SoC available, etc.)")
-					// Note: Some vehicles announce OSCEV but mark it as unavailable until certain conditions are met
-					// We'll still check scenario availability below, but won't use OSCEV if UseCaseAvailable is false
-				}
+				available := uc.UseCaseAvailable != nil && *uc.UseCaseAvailable
+				oscevAnnounced = true
+				oscevAvailable = available
 				break
 			}
 		}
@@ -139,56 +121,81 @@ func (c *iso15118ed2Controller) supportsVAS(evEntity spineapi.EntityRemoteInterf
 	}
 
 	if !oscevAnnounced {
-		c.logger.Info("VAS not detected: OSCEV use case not announced by vehicle - falling back to OPEV obligations")
+		// Only log once at debug level to avoid spam
+		c.logger.Debug("VAS not detected: OSCEV use case not announced by vehicle")
 		return false
 	}
 
 	// Secondary check: verify OSCEV scenario is available
-	// This may not be available immediately after protocol upgrade, but if the vehicle
-	// announces OSCEV support, we should try to use it anyway
-	oscEVAvailable := c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1)
-	c.logger.Debug("VAS detection: OSCEV scenario check",
-		zap.Bool("oscEV_scenario_available", oscEVAvailable))
-	
-	if !oscEVAvailable {
-		c.logger.Warn("VAS detection: OSCEV announced by vehicle but scenario not yet available - will try anyway (scenario may bind later)")
-		// Don't return false - if vehicle announces it, we should try to use it
-		// The scenario binding may happen later
+	oscEVScenarioAvailable := c.oscEV.IsScenarioAvailableAtEntity(evEntity, 1)
+
+	// VAS is supported if OSCEV is announced AND (available OR scenario is available)
+	// Some vehicles announce it but mark as unavailable until conditions are met
+	if oscevAvailable || oscEVScenarioAvailable {
+		c.logger.Info("VAS detected: OSCEV use case announced by vehicle - using recommendation mode",
+			zap.Bool("use_case_available", oscevAvailable),
+			zap.Bool("scenario_available", oscEVScenarioAvailable))
+		return true
 	}
 
-	c.logger.Info("VAS detected: OSCEV use case announced by vehicle - using recommendation mode")
-	return true
+	// OSCEV announced but not yet available - log once at debug level
+	c.logger.Debug("VAS: OSCEV announced but not yet available - may become available when charging starts")
+	return false
 }
 
-// writeVASLimits writes limits using VAS/OSCEV (recommendations)
-func (c *iso15118ed2Controller) writeVASLimits(evEntity spineapi.EntityRemoteInterface, current float64) error {
-	span := tracer.StartSpan("iso15118ed2.write_vas_limits", tracer.Tag("current", current))
+// writeOSCEVLimits writes limits using OSCEV (recommendations)
+// This is used both for VAS mode and standalone OSCEV
+func (c *iso15118ed2Controller) writeOSCEVLimits(evEntity spineapi.EntityRemoteInterface, current float64) error {
+	span := tracer.StartSpan("iso15118ed2.write_oscev_limits", tracer.Tag("current", current))
 	defer span.Finish()
 
-	// Get min limits to determine IsActive flag
-	minLimits, _, _, err := c.oscEV.CurrentLimits(evEntity)
-	if err != nil {
-		c.logger.Debug("Could not get OSCEV current limits", zap.Error(err))
-		minLimits = nil
+	// Get cached OSCEV limits from provider (avoids deadlock from calling CurrentLimits in event handler)
+	minLimits, maxLimits := c.limitsProvider.GetOSCEVLimits()
+
+	// For OSCEV in ISO mode, current=0 may cause error state in some vehicles (e.g., Porsche Macan)
+	// Use minimum current instead of 0 to avoid error state while still effectively pausing
+	effectiveCurrent := current
+	if current == 0 {
+		if minLimits != nil && len(minLimits) > 0 {
+			// Find the minimum across all phases
+			minCurrent := minLimits[0]
+			for _, min := range minLimits {
+				if min < minCurrent {
+					minCurrent = min
+				}
+			}
+			if minCurrent > 0 {
+				effectiveCurrent = minCurrent
+				c.logger.Debug("Using minimum current instead of 0 for OSCEV stop to avoid error state",
+					zap.Float64("min_current", effectiveCurrent))
+			}
+		}
+		// If no min limits available or min is 0, keep effectiveCurrent as 0
+		// (will use 0, which may cause error state, but we have no better option)
 	}
 
 	// Setup recommendation limits for all phases
 	var limits []ucapi.LoadLimitsPhase
 	for phase := 0; phase < c.chargingCfg.Phases; phase++ {
 		limit := ucapi.LoadLimitsPhase{
-			Phase: ucapi.PhaseNameMapping[phase],
-			Value: current,
+			Phase:    ucapi.PhaseNameMapping[phase],
+			IsActive: true,
+			Value:    effectiveCurrent,
 		}
 
-		// IsActive logic for OSCEV:
-		// - If value >= minLimit: IsActive=true (recommendation applies, vehicle charges)
-		// - If value < minLimit: IsActive=false (recommendation doesn't apply, vehicle pauses)
-		limit.IsActive = false
-		if minLimits != nil && phase < len(minLimits) {
-			limit.IsActive = current >= minLimits[phase]
+		// According to EEBUS spec: IsActive=true means "apply the limit", IsActive=false means "ignore the limit"
+		// If Value >= maxLimit, set IsActive=false to indicate "no constraint" (similar to OPEV behavior)
+		// If Value < maxLimit, IsActive=true means "apply this recommendation"
+		if maxLimits != nil && phase < len(maxLimits) && effectiveCurrent >= maxLimits[phase] {
+			limit.IsActive = false
 		}
 
 		limits = append(limits, limit)
+	}
+
+	// Disable OPEV limits to avoid conflicts
+	if err := c.disableOPEVLimits(evEntity); err != nil {
+		c.logger.Warn("Failed to disable OPEV limits", zap.Error(err))
 	}
 
 	// Write OSCEV recommendation limits
@@ -197,13 +204,9 @@ func (c *iso15118ed2Controller) writeVASLimits(evEntity spineapi.EntityRemoteInt
 		return err
 	}
 
-	// Disable OPEV limits to avoid conflicts
-	if err := c.disableOPEVLimits(evEntity); err != nil {
-		c.logger.Warn("Failed to disable OPEV limits", zap.Error(err))
-	}
-
-	c.logger.Debug("VAS/OSCEV recommendation limits written",
-		zap.Float64("current", current),
+	c.logger.Debug("OSCEV recommendation limits written",
+		zap.Float64("current", effectiveCurrent),
+		zap.Float64("original_current", current),
 		zap.Int("phases", len(limits)),
 		zap.Bool("active", limits[0].IsActive),
 	)
@@ -222,11 +225,29 @@ func (c *iso15118ed2Controller) writeOPEVLimits(evEntity spineapi.EntityRemoteIn
 		return ErrOverloadProtectionUnavailable
 	}
 
-	// Get current limits from EVSE
-	_, maxLimits, _, err := c.opEV.CurrentLimits(evEntity)
-	if err != nil {
-		c.logger.Debug("Could not get OPEV current limits", zap.Error(err))
-		maxLimits = nil
+	// Get cached OPEV limits from provider (avoids deadlock from calling CurrentLimits in event handler)
+	minLimits, maxLimits := c.limitsProvider.GetOPEVLimits()
+
+	// For OPEV in ISO mode, current=0 may cause error state in some vehicles (e.g., Porsche Macan)
+	// Use minimum current instead of 0 to avoid error state while still effectively pausing
+	effectiveCurrent := current
+	if current == 0 {
+		if minLimits != nil && len(minLimits) > 0 {
+			// Find the minimum across all phases
+			minCurrent := minLimits[0]
+			for _, min := range minLimits {
+				if min < minCurrent {
+					minCurrent = min
+				}
+			}
+			if minCurrent > 0 {
+				effectiveCurrent = minCurrent
+				c.logger.Debug("Using minimum current instead of 0 for OPEV stop to avoid error state",
+					zap.Float64("min_current", effectiveCurrent))
+			}
+		}
+		// If no min limits available or min is 0, keep effectiveCurrent as 0
+		// (will use 0, which may cause error state, but we have no better option)
 	}
 
 	// Setup obligation limits for all phases
@@ -235,11 +256,11 @@ func (c *iso15118ed2Controller) writeOPEVLimits(evEntity spineapi.EntityRemoteIn
 		limit := ucapi.LoadLimitsPhase{
 			Phase:    ucapi.PhaseNameMapping[phase],
 			IsActive: true,
-			Value:    current,
+			Value:    effectiveCurrent,
 		}
 
 		// If limit equals or exceeds max, the limit is inactive
-		if maxLimits != nil && phase < len(maxLimits) && current >= maxLimits[phase] {
+		if maxLimits != nil && phase < len(maxLimits) && effectiveCurrent >= maxLimits[phase] {
 			limit.IsActive = false
 		}
 
@@ -256,15 +277,17 @@ func (c *iso15118ed2Controller) writeOPEVLimits(evEntity spineapi.EntityRemoteIn
 	}
 
 	// Write OPEV obligation limits
-	_, err = c.opEV.WriteLoadControlLimits(evEntity, limits, nil)
+	_, err := c.opEV.WriteLoadControlLimits(evEntity, limits, nil)
 	if err != nil {
 		span.SetTag("error", err.Error())
 		return err
 	}
 
 	c.logger.Debug("ISO 15118-2 OPEV obligation limits written",
-		zap.Float64("current", current),
+		zap.Float64("current", effectiveCurrent),
+		zap.Float64("original_current", current),
 		zap.Int("phases", len(limits)),
+		zap.Bool("active", limits[0].IsActive),
 	)
 
 	return nil
@@ -339,4 +362,3 @@ func (c *iso15118ed2Controller) disableLimitsGeneric(
 
 	return err
 }
-
