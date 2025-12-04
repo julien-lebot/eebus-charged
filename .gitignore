@@ -3,6 +3,8 @@ eebus-hems
 eebus-hems.exe
 eebus-hems-*
 
+examples/
+
 # Certificates (regenerated automatically)
 certs/
 *.pem
