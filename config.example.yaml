@@ -29,6 +29,18 @@ network:
   # Examples: "eth0", "en0", "wlan0"
   interface: ""
 
+# Authentication configuration (optional)
+auth:
+  # Enable Basic Authentication for the API
+  enabled: false
+
+  # Username for API access
+  username: "admin"
+
+  # Password for API access
+  # CHANGE THIS if enabled!
+  password: "charged-password"
+
 # Certificate configuration
 certificates:
   # Certificates are auto-generated if not present

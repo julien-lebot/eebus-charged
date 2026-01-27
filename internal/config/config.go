@@ -18,6 +18,7 @@ type Config struct {
 	Logging      LoggingConfig      `mapstructure:"logging"`
 	Datadog      DatadogConfig      `mapstructure:"datadog"`
 	MQTT         MQTTConfig         `mapstructure:"mqtt"`
+	Auth         AuthConfig         `mapstructure:"auth"`
 	Vehicles     map[string]string  `mapstructure:"vehicles"` // Optional: map vehicle_id -> friendly_name
 }
 
@@ -83,6 +84,13 @@ type MQTTConfig struct {
 	TopicPrefix string `mapstructure:"topic_prefix"` // e.g., "hems" -> "hems/chargers/garage/..."
 }
 
+// AuthConfig contains authentication settings
+type AuthConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
+}
+
 // Load loads configuration from file
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
@@ -121,6 +129,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("mqtt.port", 1883)
 	v.SetDefault("mqtt.client_id", "eebus-charged")
 	v.SetDefault("mqtt.topic_prefix", "hems")
+	v.SetDefault("auth.enabled", false)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {

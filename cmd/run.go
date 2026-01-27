@@ -257,7 +257,7 @@ func runService(cmd *cobra.Command, args []string) error {
 
 	// Start API server for control commands
 	apiAddr := fmt.Sprintf("localhost:%d", cfg.Network.APIPort)
-	apiServer := api.NewServer(service, logger, apiAddr)
+	apiServer := api.NewServer(service, logger, apiAddr, cfg.Auth)
 	go func() {
 		if err := apiServer.Start(); err != nil {
 			logger.Error("API server failed", zap.Error(err))
