@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"crypto/subtle"
 
+	"github.com/julienar/eebus-charged/internal/config"
 	"github.com/julienar/eebus-charged/internal/eebus"
 	"go.uber.org/zap"
 	httptrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/net/http"
@@ -17,14 +19,16 @@ type Server struct {
 	service *eebus.Service
 	logger  *zap.Logger
 	addr    string
+	auth    config.AuthConfig
 }
 
 // NewServer creates a new API server
-func NewServer(service *eebus.Service, logger *zap.Logger, addr string) *Server {
+func NewServer(service *eebus.Service, logger *zap.Logger, addr string, auth config.AuthConfig) *Server {
 	return &Server{
 		service: service,
 		logger:  logger,
 		addr:    addr,
+		auth:    auth,
 	}
 }
 
@@ -35,8 +39,31 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/chargers", s.listChargers)
 	mux.HandleFunc("/api/chargers/", s.handleCharger)
 
+	var handler http.Handler = mux
+
+	// Add Basic Auth middleware if enabled
+	if s.auth.Enabled {
+		handler = s.basicAuthMiddleware(handler)
+		s.logger.Info("API Authentication enabled")
+	}
+
 	s.logger.Info("Starting API server", zap.String("addr", s.addr))
-	return http.ListenAndServe(s.addr, mux)
+	return http.ListenAndServe(s.addr, handler)
+}
+
+// basicAuthMiddleware enforces Basic Authentication
+func (s *Server) basicAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(s.auth.Username)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(s.auth.Password)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			s.writeError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Response types
