@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -133,6 +134,11 @@ func (s *Server) handleCharger(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+
+		if !s.ensureJSONContentType(w, r) {
+			return
+		}
+
 		if err := charger.StartCharging(); err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -147,6 +153,11 @@ func (s *Server) handleCharger(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+
+		if !s.ensureJSONContentType(w, r) {
+			return
+		}
+
 		if err := charger.StopCharging(); err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -159,6 +170,10 @@ func (s *Server) handleCharger(w http.ResponseWriter, r *http.Request) {
 	case "current":
 		if r.Method != http.MethodPut && r.Method != http.MethodPost {
 			s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		if !s.ensureJSONContentType(w, r) {
 			return
 		}
 		
@@ -253,3 +268,19 @@ func getStringOrEmpty(m map[string]interface{}, key string) string {
 	return ""
 }
 
+// ensureJSONContentType checks if the Content-Type header is application/json
+func (s *Server) ensureJSONContentType(w http.ResponseWriter, r *http.Request) bool {
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		s.writeError(w, http.StatusUnsupportedMediaType, "Content-Type application/json required")
+		return false
+	}
+
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "application/json" {
+		s.writeError(w, http.StatusUnsupportedMediaType, "Content-Type application/json required")
+		return false
+	}
+
+	return true
+}
