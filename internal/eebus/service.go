@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -613,11 +614,5 @@ func (s *Service) Errorf(format string, args ...interface{}) {
 
 // normalizeSkI removes spaces and dashes from SKI
 func normalizeSkI(ski string) string {
-	result := ""
-	for _, c := range ski {
-		if c != ' ' && c != '-' {
-			result += string(c)
-		}
-	}
-	return result
+	return strings.ReplaceAll(strings.ReplaceAll(ski, "-", ""), " ", "")
 }
