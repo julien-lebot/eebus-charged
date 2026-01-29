@@ -205,28 +205,28 @@ func (s *Server) chargerToStatus(charger *eebus.Charger) StatusResponse {
 	status := charger.GetStatus()
 	
 	resp := StatusResponse{
-		Name:          status["name"].(string),
-		SKI:           status["ski"].(string),
-		Connected:     status["connected"].(bool),
-		ChargingState: status["charging_state"].(string),
-		CurrentLimit:  status["current_limit"].(float64),
-		MinCurrent:    status["min_current"].(float64),
-		MaxCurrent:    status["max_current"].(float64),
-		VehicleID:     getStringOrEmpty(status, "vehicle_id"),
-		VehicleName:   getStringOrEmpty(status, "vehicle_name"),
+		Name:          status.Name,
+		SKI:           status.SKI,
+		Connected:     status.Connected,
+		ChargingState: string(status.ChargingState),
+		CurrentLimit:  status.CurrentLimit,
+		MinCurrent:    status.MinCurrent,
+		MaxCurrent:    status.MaxCurrent,
+		VehicleID:     status.VehicleID,
+		VehicleName:   "", // Not yet available in status
 	}
 	
 	// Add capabilities if available
-	if commStd, ok := status["communication_standard"].(string); ok {
-		resp.CommunicationStandard = commStd
+	if status.CommunicationStandard != "" {
+		resp.CommunicationStandard = status.CommunicationStandard
 	}
-	if ctrlType, ok := status["controller_type"].(string); ok {
-		resp.ControllerType = ctrlType
+	if status.ControllerType != "" {
+		resp.ControllerType = status.ControllerType
 	}
 	
 	// Extract features from status (built in charger.go)
-	if features, ok := status["features"].(map[string]map[string]interface{}); ok {
-		resp.Features = features
+	if status.Features != nil {
+		resp.Features = status.Features
 	}
 	
 	return resp
@@ -242,14 +242,5 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.logger.Warn("API error", zap.String("error", message), zap.Int("status", status))
 	s.writeJSON(w, status, ErrorResponse{Error: message})
-}
-
-func getStringOrEmpty(m map[string]interface{}, key string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return ""
 }
 

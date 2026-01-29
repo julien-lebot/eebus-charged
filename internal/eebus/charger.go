@@ -26,6 +26,21 @@ const (
 // ChargingState represents the current charging state
 type ChargingState string
 
+// ChargerStatus represents the detailed status of a charger
+type ChargerStatus struct {
+	Name                  string
+	SKI                   string
+	Connected             bool
+	ChargingState         ChargingState
+	CurrentLimit          float64
+	MinCurrent            float64
+	MaxCurrent            float64
+	VehicleID             string
+	CommunicationStandard string
+	ControllerType        string
+	Features              map[string]map[string]interface{}
+}
+
 const (
 	ChargingStateStopped ChargingState = "stopped"
 	ChargingStateActive  ChargingState = "active"
@@ -344,24 +359,24 @@ func (c *Charger) GetOSCEVLimits() (minLimits, maxLimits []float64) {
 }
 
 // GetStatus returns detailed status information
-func (c *Charger) GetStatus() map[string]interface{} {
+func (c *Charger) GetStatus() ChargerStatus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	effectiveMin, effectiveMax := c.getEffectiveLimits()
 
-	status := map[string]interface{}{
-		"name":           c.config.Name,
-		"ski":            c.device.Ski(),
-		"connected":      c.isConnected,
-		"charging_state": string(c.chargingState),
-		"current_limit":  c.currentLimit,
-		"min_current":    effectiveMin,
-		"max_current":    effectiveMax,
+	status := ChargerStatus{
+		Name:          c.config.Name,
+		SKI:           c.device.Ski(),
+		Connected:     c.isConnected,
+		ChargingState: c.chargingState,
+		CurrentLimit:  c.currentLimit,
+		MinCurrent:    effectiveMin,
+		MaxCurrent:    effectiveMax,
 	}
 
 	if c.isConnected {
-		status["vehicle_id"] = c.vehicleID
+		status.VehicleID = c.vehicleID
 	}
 
 	// Build unified features map
@@ -370,8 +385,8 @@ func (c *Charger) GetStatus() map[string]interface{} {
 	// Add capabilities if controller is available
 	if c.controller != nil && c.evEntity != nil {
 		capabilities := c.controller.GetCapabilities(c.evEntity)
-		status["communication_standard"] = capabilities.CommunicationStandard
-		status["controller_type"] = capabilities.ControllerType
+		status.CommunicationStandard = capabilities.CommunicationStandard
+		status.ControllerType = capabilities.ControllerType
 		
 		// VAS feature (only for ISO 15118-2ed2)
 		if capabilities.VASSupported != nil {
@@ -388,8 +403,8 @@ func (c *Charger) GetStatus() map[string]interface{} {
 		}
 	} else if c.communicationStandard != "" {
 		// Protocol known but controller not yet created
-		status["communication_standard"] = c.communicationStandard
-		status["controller_type"] = "pending"
+		status.CommunicationStandard = c.communicationStandard
+		status.ControllerType = "pending"
 	}
 	
 	// Always show OSCEV feature if we have limits from hardware
@@ -446,7 +461,7 @@ func (c *Charger) GetStatus() map[string]interface{} {
 	
 	// Add features to status if any exist
 	if len(features) > 0 {
-		status["features"] = features
+		status.Features = features
 	}
 
 	return status
