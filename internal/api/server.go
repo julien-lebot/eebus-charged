@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/julienar/eebus-charged/internal/eebus"
 	"go.uber.org/zap"
@@ -36,7 +37,30 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/chargers/", s.handleCharger)
 
 	s.logger.Info("Starting API server", zap.String("addr", s.addr))
-	return http.ListenAndServe(s.addr, mux)
+
+	srv := &http.Server{
+		Addr:              s.addr,
+		Handler:           s.securityMiddleware(mux),
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	return srv.ListenAndServe()
+}
+
+// securityMiddleware adds security headers to the response
+func (s *Server) securityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Response types
